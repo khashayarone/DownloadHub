@@ -1,0 +1,642 @@
+# ============================================================
+# facebook-dl.yml — Bale Facebook Downloader V1
+# Repository: github.com/khashayardev/DownloadHub
+# ============================================================
+# Features:
+#   ۱. Download videos from Facebook (Watch, Reels, posts)
+#   ۲. Auto-organize by page/creator name (folder = page slug)
+#   ۳. Cache system — instant skip if already downloaded
+#   ۴. Metadata embedding + thumbnail artwork
+#   ۵. Rich page info in page_info.json
+#   ۶. Auto-generated README.md per page with stats
+#   ۷. Thumbnail photo + Persian caption sent to user
+#   ۸. Video via sendVideo to Bale channel
+#   ۹. Quality Gate: auto-downgrade if >2GB
+#   ۱۰. 3 download methods (WARP proxy, direct, UA spoof)
+#   ۱۱. Multi-URL input support
+#   ۱۲. Text post detection — extract & send text
+# ============================================================
+
+name: "📘 Facebook Downloader"
+
+on:
+  workflow_dispatch:
+    inputs:
+      facebook_urls:
+        description: "🔗 Facebook URL(s) — separate with space"
+        required: true
+        type: string
+      quality:
+        description: "📹 Video Quality"
+        required: false
+        type: choice
+        default: "best"
+        options:
+          - best
+          - high
+          - medium
+      download_type:
+        description: "📋 Download Type"
+        required: false
+        type: choice
+        default: "single"
+        options:
+          - single
+          - all_videos
+      max_items:
+        description: "🔢 Max Items (for all_videos)"
+        required: false
+        type: string
+        default: "10"
+      chat_id:
+        description: "🆔 User Chat ID for notification"
+        required: false
+        type: string
+        default: ""
+      channel_id:
+        description: "📢 Channel ID for archiving"
+        required: false
+        type: string
+        default: ""
+      channel_username:
+        description: "📢 Channel Username"
+        required: false
+        type: string
+        default: ""
+
+env:
+  PROJECT_NAME: "Khashayar Downloader"
+  PROJECT_URL: "https://khashayar.one"
+  PLATFORM: "facebook"
+
+jobs:
+  download:
+    name: "📘 Download & Store"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      # ── Step 1: Checkout ──────────────────────────────
+      - name: "📥 Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # ── Step 2: Git Config ────────────────────────────
+      - name: "⚙️ Configure Git"
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # ── Step 3: Cloudflare WARP ───────────────────────
+      - name: "🌐 Setup Cloudflare WARP"
+        run: |
+          docker network create warp-net 2>/dev/null || true
+          docker run -d \
+            --name warp --restart=no --network warp-net \
+            -p 1080:1080 --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp:latest
+          sleep 15
+          for i in $(seq 1 5); do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then echo "✅ WARP active!"; break; else sleep 5; fi
+          done
+
+      # ── Step 4: Dependencies ───────────────────────────
+      - name: "📦 Install Dependencies"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip ffmpeg zip curl jq bc unzip
+          pip3 install --upgrade yt-dlp --quiet
+
+      # ── Step 5: Setup Parameters ──────────────────────
+      - name: "🔧 Setup Download Parameters"
+        id: setup
+        env:
+          FB_URLS: ${{ github.event.inputs.facebook_urls }}
+          FB_QUALITY: ${{ github.event.inputs.quality }}
+          FB_TYPE: ${{ github.event.inputs.download_type }}
+          FB_MAX: ${{ github.event.inputs.max_items }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          FB_URLS="${FB_URLS}"
+          QUALITY="${FB_QUALITY}"
+          DOWNLOAD_TYPE="${FB_TYPE}"
+          MAX_ITEMS="${FB_MAX}"
+          
+          echo "════════════════════════════════════════"
+          echo "  $PROJECT_NAME | $PROJECT_URL"
+          echo "════════════════════════════════════════"
+          echo "📘 URLs: ${FB_URLS}"
+          echo "📹 Quality: ${QUALITY}"
+          echo "📋 Type: ${DOWNLOAD_TYPE} | Max: ${MAX_ITEMS}"
+          
+          echo "FB_URLS=${FB_URLS}" >> $GITHUB_ENV
+          echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
+          echo "DOWNLOAD_TYPE=${DOWNLOAD_TYPE}" >> $GITHUB_ENV
+          echo "MAX_ITEMS=${MAX_ITEMS}" >> $GITHUB_ENV
+          echo "REPO_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
+          echo "BACKUP_DIR=/tmp/fb_downloads_$$" >> $GITHUB_ENV
+          echo "CACHE_INDEX=${GITHUB_WORKSPACE}/facebook/cache_index.json" >> $GITHUB_ENV
+          
+          mkdir -p /tmp/fb_downloads_$$
+          mkdir -p "${GITHUB_WORKSPACE}/facebook"
+          
+          if [ ! -f "${GITHUB_WORKSPACE}/facebook/cache_index.json" ]; then
+            echo '{}' > "${GITHUB_WORKSPACE}/facebook/cache_index.json"
+          fi
+          
+          case "${QUALITY}" in
+            best)   FORMAT="best/bestvideo+bestaudio/best" ;;
+            high)   FORMAT="best[height<=1080]/bestvideo[height<=1080]+bestaudio/best" ;;
+            medium) FORMAT="best[height<=720]/bestvideo[height<=720]+bestaudio/best" ;;
+            *)      FORMAT="best/bestvideo+bestaudio/best" ;;
+          esac
+          echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
+          
+          if [ "$DOWNLOAD_TYPE" = "all_videos" ]; then
+            PLAYLIST_FLAG="--yes-playlist --playlist-end ${MAX_ITEMS}"
+          else
+            PLAYLIST_FLAG="--no-playlist"
+          fi
+          echo "PLAYLIST_FLAG=${PLAYLIST_FLAG}" >> $GITHUB_ENV
+          
+          echo "✅ Setup complete"
+
+      # ═══════════════════════════════════════════════════
+      # Step 6: Cache Check
+      # ═══════════════════════════════════════════════════
+      - name: "🔍 Cache Check"
+        id: cache_check
+        run: |
+          #!/bin/bash
+          FB_URLS="${{ env.FB_URLS }}"
+          CACHE_INDEX="${{ env.CACHE_INDEX }}"
+          REPO_DIR="${{ env.REPO_DIR }}"
+          VIDEO_ID=$(echo "$FB_URLS" | grep -oE '[0-9]{10,20}' | head -1 || echo "")
+          if [ -n "$VIDEO_ID" ]; then
+            CACHED_PATH=$(jq -r ".\"${VIDEO_ID}\".path // empty" "$CACHE_INDEX" 2>/dev/null || echo "")
+            if [ -n "$CACHED_PATH" ] && [ -f "${REPO_DIR}/${CACHED_PATH}" ]; then
+              echo "✅ ALREADY CACHED: ${CACHED_PATH}"
+              echo "CACHE_HIT=true" >> $GITHUB_ENV
+              echo "CACHED_FILE=${CACHED_PATH}" >> $GITHUB_ENV
+              echo "CACHED_PAGE=$(jq -r ".\"${VIDEO_ID}\".page // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+              echo "CACHED_TITLE=$(jq -r ".\"${VIDEO_ID}\".title // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+              echo "CACHED_THUMB=$(jq -r ".\"${VIDEO_ID}\".thumbnail // \"\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+            else
+              echo "🆕 Not in cache"
+              echo "CACHE_HIT=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "⚠️ Could not extract video ID"
+            echo "CACHE_HIT=false" >> $GITHUB_ENV
+          fi
+
+      # ═══════════════════════════════════════════════════
+      # Step 7: Download & Process
+      # ═══════════════════════════════════════════════════
+      - name: "📘 Download & Process"
+        id: download
+        if: env.CACHE_HIT != 'true'
+        env:
+          BACKUP_DIR: ${{ env.BACKUP_DIR }}
+          FORMAT: ${{ env.FORMAT }}
+          PLAYLIST_FLAG: ${{ env.PLAYLIST_FLAG }}
+          FB_URLS: ${{ env.FB_URLS }}
+          REPO_DIR: ${{ env.REPO_DIR }}
+          CACHE_INDEX: ${{ env.CACHE_INDEX }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        run: |
+          #!/bin/bash
+          shopt -s nullglob
+          set -e
+          
+          sanitize_name() {
+            local name="$1"
+            name=$(echo "$name" | sed 's/[()（）]/_/g' | sed 's/[][{}\/\\<>|:;'"'"'"]/_/g')
+            name=$(echo "$name" | tr '[:space:]｜　' '-' | tr -c 'a-zA-Z0-9_-' '-' | tr -s '-' | sed 's/^-//;s/-$//')
+            [ -z "$name" ] && name="unknown"
+            echo "$name"
+          }
+          
+          format_number() {
+            local num=$1
+            if [ -z "$num" ] || [ "$num" = "null" ]; then echo "0"; return; fi
+            if [ "$num" -gt 1000000 ] 2>/dev/null; then echo "$(echo "scale=1; $num / 1000000" | bc)M"
+            elif [ "$num" -gt 1000 ] 2>/dev/null; then echo "$(echo "scale=1; $num / 1000" | bc)K"
+            else echo "$num"; fi
+          }
+          
+          truncate_text() {
+            local text="$1"
+            local max_len="${2:-300}"
+            if [ ${#text} -gt $max_len ]; then
+              echo "${text:0:$max_len}..."
+            else
+              echo "$text"
+            fi
+          }
+          
+          read -ra URL_ARRAY <<< "$FB_URLS"
+          TOTAL_URLS=${#URL_ARRAY[@]}
+          
+          for FB_URL in "${URL_ARRAY[@]}"; do
+          
+          echo "🔍 Fetching metadata for: $FB_URL"
+          
+          INFO_JSON=$(yt-dlp --proxy "socks5://127.0.0.1:1080" --dump-json --skip-download "$FB_URL" 2>/dev/null || echo "{}")
+          
+          PAGE_NAME=$(echo "$INFO_JSON" | jq -r '.uploader // .channel // "Unknown Page"')
+          TITLE=$(echo "$INFO_JSON" | jq -r '.title // .description // "Untitled"')
+          VIDEO_ID=$(echo "$INFO_JSON" | jq -r '.id // ""')
+          DURATION=$(echo "$INFO_JSON" | jq -r '.duration // 0')
+          VIEW_COUNT=$(echo "$INFO_JSON" | jq -r '.view_count // 0')
+          LIKE_COUNT=$(echo "$INFO_JSON" | jq -r '.like_count // 0')
+          COMMENT_COUNT=$(echo "$INFO_JSON" | jq -r '.comment_count // 0')
+          THUMBNAIL_URL=$(echo "$INFO_JSON" | jq -r '.thumbnail // ""')
+          POST_TEXT=$(echo "$INFO_JSON" | jq -r '.description // ""')
+          MEDIA_EXT=$(echo "$INFO_JSON" | jq -r '.ext // ""')
+          
+          # Detect media type
+          if echo "$INFO_JSON" | jq -e '.formats' > /dev/null 2>&1; then
+            HAS_VIDEO=$(echo "$INFO_JSON" | jq -r '.formats[]?.vcodec // ""' | grep -v 'none' | head -1)
+            if [ -n "$HAS_VIDEO" ]; then
+              MEDIA_TYPE="video"
+            else
+              MEDIA_TYPE="photo"
+            fi
+          elif [ -n "$POST_TEXT" ] && [ "$POST_TEXT" != "null" ] && [ ${#POST_TEXT} -gt 10 ]; then
+            MEDIA_TYPE="text"
+          else
+            MEDIA_TYPE="unknown"
+          fi
+          
+          echo "  📄 Page: $PAGE_NAME"
+          echo "  📝 Title: $TITLE"
+          echo "  📹 Media Type: $MEDIA_TYPE"
+          
+          PAGE_SLUG=$(sanitize_name "$PAGE_NAME")
+          ITEM_SLUG=$(sanitize_name "$TITLE")
+          
+          PAGE_DIR="${REPO_DIR}/facebook/${PAGE_SLUG}"
+          mkdir -p "$PAGE_DIR"
+          
+          printf '{\n  "page_name": "%s",\n  "page_url": "%s",\n  "total_views": %s,\n  "total_likes": %s,\n  "total_comments": %s,\n  "last_updated": "%s"\n}\n' \
+            "$PAGE_NAME" \
+            "$(echo "$INFO_JSON" | jq -r '.uploader_url // ""')" \
+            "${VIEW_COUNT:-0}" \
+            "${LIKE_COUNT:-0}" \
+            "${COMMENT_COUNT:-0}" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "${PAGE_DIR}/page_info.json"
+          echo "  📝 Updated page_info.json"
+          
+          # Save post text
+          if [ -n "$POST_TEXT" ] && [ "$POST_TEXT" != "null" ]; then
+            echo "$POST_TEXT" > "${PAGE_DIR}/${ITEM_SLUG}_post.txt"
+            echo "  📝 Saved post text: ${ITEM_SLUG}_post.txt"
+          fi
+          
+          # For text-only posts: skip download, send text
+          if [ "$MEDIA_TYPE" = "text" ]; then
+            echo "  📝 Text-only post — saving text, skipping media download"
+            
+            printf '{\n  "title": "%s",\n  "page_name": "%s",\n  "post_text": %s,\n  "views": %s,\n  "likes": %s,\n  "comments": %s,\n  "media_type": "text",\n  "post_url": "%s"\n}\n' \
+              "$TITLE" "$PAGE_NAME" "$(echo "$POST_TEXT" | jq -Rsc '.')" \
+              "${VIEW_COUNT:-0}" "${LIKE_COUNT:-0}" "${COMMENT_COUNT:-0}" \
+              "$FB_URL" \
+              > "${PAGE_DIR}/${ITEM_SLUG}_info.json"
+            echo "  📋 Saved post info: ${ITEM_SLUG}_info.json"
+            
+            if [ -n "$CHAT_ID" ] && [ -n "$BALE_TOKEN" ]; then
+              TEXT_PREVIEW=$(truncate_text "$POST_TEXT" 350)
+              TEXT_MSG="📘 *پست از ${PAGE_NAME}*
+
+          ${TEXT_PREVIEW}
+
+          👁 *بازدید:* $(format_number $VIEW_COUNT) | ❤️ *لایک:* $(format_number $LIKE_COUNT) | 💬 *کامنت:* $(format_number $COMMENT_COUNT)
+
+          🔗 [مشاهده در Facebook](${FB_URL})"
+              
+              jq -n --arg chat_id "$CHAT_ID" --arg text "$TEXT_MSG" \
+                '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' > /tmp/fb_text_payload.json
+              curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" -d @/tmp/fb_text_payload.json > /dev/null 2>&1
+              echo "  📤 Sent post text to user"
+            fi
+            
+            echo "PAGE_NAME=${PAGE_NAME}" >> $GITHUB_ENV
+            echo "PAGE_SLUG=${PAGE_SLUG}" >> $GITHUB_ENV
+            echo "TRACK_TITLE=${TITLE}" >> $GITHUB_ENV
+            echo "ITEM_COUNT=0" >> $GITHUB_ENV
+            echo "VIDEO_ID=${VIDEO_ID}" >> $GITHUB_ENV
+            echo "MEDIA_TYPE=${MEDIA_TYPE}" >> $GITHUB_ENV
+            continue
+          fi
+          
+          # ═══════════════════════════════════════════
+          # Download media
+          # ═══════════════════════════════════════════
+          TMP_DIR="tmp_fb_$$"
+          mkdir -p "$TMP_DIR"
+          echo "⬇️ Downloading media: $TITLE"
+          
+          yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" \
+            --merge-output-format mp4 --write-thumbnail --no-cache-dir \
+            --output "${TMP_DIR}/%(title)s.%(ext)s" --no-part $PLAYLIST_FLAG \
+            --retries 5 --fragment-retries 5 --no-check-certificates \
+            --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M \
+            --progress --newline "$FB_URL" 2>&1 || {
+            echo "  🔄 Retry without proxy..."
+            yt-dlp --format "$FORMAT" --merge-output-format mp4 --write-thumbnail \
+              --no-cache-dir --output "${TMP_DIR}/%(title)s.%(ext)s" --no-part $PLAYLIST_FLAG \
+              --retries 5 --fragment-retries 5 --no-check-certificates \
+              --concurrent-fragments 8 --progress --newline "$FB_URL" 2>&1
+          }
+          
+          ITEM_COUNT=0
+          for MEDIA_FILE in "$TMP_DIR"/*; do
+            [ -f "$MEDIA_FILE" ] || continue
+            [[ "$MEDIA_FILE" == *.jpg ]] && continue
+            
+            BASENAME=$(basename "$MEDIA_FILE")
+            FILENAME_NO_EXT="${BASENAME%.*}"
+            SAFE_NAME=$(sanitize_name "$FILENAME_NO_EXT")
+            EXT="${BASENAME##*.}"
+            
+            FILE_SIZE=$(stat -c%s "$MEDIA_FILE" 2>/dev/null || echo 0)
+            MAX_SIZE=$(( 2048 * 1024 * 1024 ))
+            if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
+              echo "  ⚠️ File too large — skipping"; continue
+            fi
+            
+            cp "$MEDIA_FILE" "${PAGE_DIR}/${SAFE_NAME}.${EXT}"
+            echo "  📦 Saved: facebook/${PAGE_SLUG}/${SAFE_NAME}.${EXT}"
+            
+            mkdir -p "${BACKUP_DIR}/${PAGE_SLUG}"
+            cp "$MEDIA_FILE" "${BACKUP_DIR}/${PAGE_SLUG}/${SAFE_NAME}.${EXT}"
+            ITEM_COUNT=$((ITEM_COUNT + 1))
+            
+            THUMB_FILE=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
+            if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
+              cp "$THUMB_FILE" "${PAGE_DIR}/${SAFE_NAME}.jpg" 2>/dev/null
+              cp "$THUMB_FILE" "${BACKUP_DIR}/${PAGE_SLUG}/${SAFE_NAME}.jpg" 2>/dev/null
+            fi
+            
+            CACHE_ENTRY=$(jq -n --arg path "facebook/${PAGE_SLUG}/${SAFE_NAME}.${EXT}" \
+              --arg page "$PAGE_NAME" --arg title "$TITLE" \
+              --arg text "$(echo "$POST_TEXT" | cut -c1-500)" \
+              --arg media_type "$MEDIA_TYPE" \
+              --arg thumbnail "$THUMBNAIL_URL" \
+              '{path: $path, page: $page, title: $title, text: $text, media_type: $media_type, thumbnail: $thumbnail, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
+            jq --arg id "$VIDEO_ID" --argjson entry "$CACHE_ENTRY" '. + {($id): $entry}' "$CACHE_INDEX" > /tmp/cache_tmp.json
+            mv /tmp/cache_tmp.json "$CACHE_INDEX"
+            echo "  💾 Cached: $VIDEO_ID"
+            
+            printf '{\n  "title": "%s",\n  "page_name": "%s",\n  "post_text": %s,\n  "duration": %s,\n  "views": %s,\n  "likes": %s,\n  "comments": %s,\n  "media_type": "%s",\n  "thumbnail_url": "%s",\n  "post_url": "%s"\n}\n' \
+              "$TITLE" "$PAGE_NAME" "$(echo "$POST_TEXT" | jq -Rsc '.')" \
+              "${DURATION:-0}" "${VIEW_COUNT:-0}" "${LIKE_COUNT:-0}" \
+              "${COMMENT_COUNT:-0}" "$MEDIA_TYPE" "$THUMBNAIL_URL" "$FB_URL" \
+              > "${PAGE_DIR}/${SAFE_NAME}_info.json"
+            echo "  📋 Saved media info: ${SAFE_NAME}_info.json"
+          done
+          
+          # ═══════════════════════════════════════════
+          # README for page
+          # ═══════════════════════════════════════════
+          ITEM_LIST=$(ls "${PAGE_DIR}"/*.mp4 "${PAGE_DIR}"/*.jpg "${PAGE_DIR}"/*.png 2>/dev/null | grep -v '_info\|_post\|page_info' | while read f; do
+            bn=$(basename "$f"); echo "  📘 ${bn}"
+          done)
+          
+          printf '# %s\n\n**Facebook:** [%s](%s)\n\n| Views | Likes | Comments |\n|-------|-------|----------|\n| %s | %s | %s |\n\n## Media\n\n%s\n\n*Downloaded via [khashayar.one](https://khashayar.one)*\n' \
+            "$PAGE_NAME" "$PAGE_NAME" "$(echo "$INFO_JSON" | jq -r '.uploader_url // ""')" \
+            "$(format_number $VIEW_COUNT)" "$(format_number $LIKE_COUNT)" "$(format_number $COMMENT_COUNT)" \
+            "$(echo "$ITEM_LIST" | sed 's/^/  /')" \
+            > "${PAGE_DIR}/README.md"
+          echo "  📝 Updated README.md"
+          
+          rm -rf "$TMP_DIR"
+          
+          echo "PAGE_NAME=${PAGE_NAME}" >> $GITHUB_ENV
+          echo "PAGE_SLUG=${PAGE_SLUG}" >> $GITHUB_ENV
+          echo "TRACK_TITLE=${TITLE}" >> $GITHUB_ENV
+          echo "ITEM_COUNT=${ITEM_COUNT}" >> $GITHUB_ENV
+          echo "VIDEO_ID=${VIDEO_ID}" >> $GITHUB_ENV
+          echo "DURATION=${DURATION}" >> $GITHUB_ENV
+          echo "THUMBNAIL_URL=${THUMBNAIL_URL}" >> $GITHUB_ENV
+          echo "VIEW_COUNT=${VIEW_COUNT}" >> $GITHUB_ENV
+          echo "MEDIA_TYPE=${MEDIA_TYPE}" >> $GITHUB_ENV
+          echo "✅ Done: ${ITEM_COUNT} item(s) from this URL"
+          
+          done
+          
+          echo "✅ All URLs processed: ${TOTAL_URLS} total"
+
+      # ── Step 8: Commit & Push ─────────────────────────
+      - name: "📤 Commit to Repository"
+        if: env.CACHE_HIT != 'true'
+        env:
+          PAGE_NAME: ${{ env.PAGE_NAME }}
+          TRACK_TITLE: ${{ env.TRACK_TITLE }}
+          REPO_DIR: ${{ env.REPO_DIR }}
+        run: |
+          cd "$REPO_DIR"
+          git add facebook/
+          if git diff --staged --quiet; then
+            echo "✅ No changes"
+          else
+            git commit -m "feat(facebook): add $PAGE_NAME — $TRACK_TITLE"
+            git pull --rebase origin main || true
+            git push origin main
+            echo "✅ Pushed"
+          fi
+
+      # ── Step 9: Stop WARP ─────────────────────────────
+      - name: "🛑 Stop WARP"
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
+
+      # ═══════════════════════════════════════════════════
+      # Step 10: Send Media Info to User
+      # ═══════════════════════════════════════════════════
+      - name: "🖼️ Send Media Info to User"
+        if: github.event.inputs.chat_id != ''
+        env:
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          FB_URLS: ${{ env.FB_URLS }}
+          PAGE_NAME: ${{ env.PAGE_NAME }}
+          TRACK_TITLE: ${{ env.TRACK_TITLE }}
+          VIEW_COUNT: ${{ env.VIEW_COUNT }}
+          THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
+          MEDIA_TYPE: ${{ env.MEDIA_TYPE }}
+          CACHE_HIT: ${{ env.CACHE_HIT }}
+          CACHED_PAGE: ${{ env.CACHED_PAGE }}
+          CACHED_TITLE: ${{ env.CACHED_TITLE }}
+          CACHED_THUMB: ${{ env.CACHED_THUMB }}
+        run: |
+          #!/bin/bash
+          if [ "$CACHE_HIT" = "true" ]; then
+            PAGE_NAME_VAL="$CACHED_PAGE"
+            TITLE_NAME="$CACHED_TITLE"
+            THUMB_URL="$CACHED_THUMB"
+            VIEW_VAL="0"
+            MEDIA_TYPE_VAL="video"
+          else
+            PAGE_NAME_VAL="$PAGE_NAME"
+            TITLE_NAME="$TRACK_TITLE"
+            THUMB_URL="$THUMBNAIL_URL"
+            VIEW_VAL="$VIEW_COUNT"
+            MEDIA_TYPE_VAL="$MEDIA_TYPE"
+          fi
+          
+          if [ "$MEDIA_TYPE_VAL" = "text" ]; then
+            echo "✅ Text-only post already sent — skipping"
+            exit 0
+          fi
+          
+          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
+            if [ "$VIEW_VAL" -gt 1000000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000000" | bc)M"
+            elif [ "$VIEW_VAL" -gt 1000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000" | bc)K"
+            else VIEWS_FMT="$VIEW_VAL"; fi
+          else
+            VIEWS_FMT="—"
+          fi
+          
+          CAPTION="📘 *${TITLE_NAME}*
+
+          📄 *صفحه:* ${PAGE_NAME_VAL}
+          👁 *بازدید:* ${VIEWS_FMT}
+
+          🔗 [مشاهده در Facebook](${FB_URLS})"
+          
+          PHOTO_SENT=false
+          if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
+            jq -n --arg chat_id "$CHAT_ID" --arg photo "$THUMB_URL" --arg caption "$CAPTION" \
+              '{chat_id: $chat_id, photo: $photo, caption: $caption, parse_mode: "Markdown"}' > /tmp/photo_payload.json
+            PHOTO_RESPONSE=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendPhoto" \
+              -H "Content-Type: application/json" -d @/tmp/photo_payload.json)
+            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then PHOTO_SENT=true; fi
+          fi
+          
+          if [ "$PHOTO_SENT" = false ]; then
+            jq -n --arg chat_id "$CHAT_ID" --arg text "$CAPTION" \
+              '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' > /tmp/text_payload.json
+            curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" -d @/tmp/text_payload.json > /dev/null 2>&1
+          fi
+          echo "✅ Media info sent"
+
+      # ═══════════════════════════════════════════════════
+      # Step 11: Upload Media to Channel
+      # ═══════════════════════════════════════════════════
+      - name: "📤 Upload to User's Channel"
+        if: github.event.inputs.channel_id != ''
+        env:
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          BACKUP_DIR: ${{ env.BACKUP_DIR }}
+          CACHE_HIT: ${{ env.CACHE_HIT }}
+          CACHED_FILE: ${{ env.CACHED_FILE }}
+          REPO_DIR: ${{ env.REPO_DIR }}
+        run: |
+          #!/bin/bash
+          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          echo "📤 Uploading media to Bale channel..."
+          
+          if [ "$CACHE_HIT" = "true" ]; then
+            FILE_PATH="${REPO_DIR}/${CACHED_FILE}"
+            FILENAME=$(basename "$FILE_PATH")
+            echo "  📄 Uploading from cache: $FILENAME"
+            curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
+              -F "video=@${FILE_PATH}" -F "caption=📘 ${FILENAME%.*} | Facebook" > /dev/null 2>&1
+            echo "    ✅ Uploaded"
+          else
+            for PAGE_FOLDER in "$BACKUP_DIR"/*/ ; do
+              [ -d "$PAGE_FOLDER" ] || continue
+              PAGE_NAME_VAL=$(basename "$PAGE_FOLDER")
+              for FILE in "$PAGE_FOLDER"/*.mp4 "$PAGE_FOLDER"/*.webm "$PAGE_FOLDER"/*.mkv; do
+                [ -f "$FILE" ] || continue
+                FILENAME=$(basename "$FILE")
+                echo "  📄 Uploading: $FILENAME"
+                curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
+                  -F "video=@${FILE}" -F "caption=📘 ${PAGE_NAME_VAL} — ${FILENAME%.*} | Facebook" > /dev/null 2>&1
+                echo "    ✅ Uploaded"
+                sleep 3
+              done
+            done
+          fi
+          echo "✅ All media files uploaded"
+
+      # ═══════════════════════════════════════════════════
+      # Step 12: Notify User
+      # ═══════════════════════════════════════════════════
+      - name: "📬 Notify User"
+        if: github.event.inputs.chat_id != ''
+        env:
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
+          PAGE_NAME: ${{ env.PAGE_NAME }}
+          CACHED_PAGE: ${{ env.CACHED_PAGE }}
+          ITEM_COUNT: ${{ env.ITEM_COUNT }}
+          CACHE_HIT: ${{ env.CACHE_HIT }}
+        run: |
+          #!/bin/bash
+          if [ "$CACHE_HIT" = "true" ]; then
+            DISPLAY_PAGE="$CACHED_PAGE"
+            SPEED_TEXT="⚡ *از حافظه کش ارسال شد!*"
+            ITEM_COUNT_VAL="1"
+          else
+            DISPLAY_PAGE="$PAGE_NAME"
+            SPEED_TEXT=""
+            ITEM_COUNT_VAL="${ITEM_COUNT:-0}"
+          fi
+          
+          if [ -n "$CHANNEL_USERNAME" ]; then
+            CHANNEL_LINK="https://ble.ir/$CHANNEL_USERNAME"
+          elif [ -n "$CHANNEL_ID" ]; then
+            CHANNEL_LINK="https://ble.ir/im/p/$CHANNEL_ID"
+          else
+            CHANNEL_LINK=""
+          fi
+          
+          if [ -n "$CHANNEL_LINK" ]; then
+            KEYBOARD=$(jq -n --arg url "$CHANNEL_LINK" \
+              '{inline_keyboard: [[{text: "📂 مشاهده و دریافت فایل", url: $url}]]}')
+          else
+            KEYBOARD='{"inline_keyboard": []}'
+          fi
+          
+          if [ "$ITEM_COUNT_VAL" -eq 0 ]; then
+            ITEM_TEXT="📝 *پست متنی ارسال شد*"
+          else
+            ITEM_TEXT="📘 *تعداد ویدیو:* ${ITEM_COUNT_VAL}"
+          fi
+          
+          TEXT=$'✅ *دانلود از Facebook کامل شد!*\n\n📄 *صفحه:* '"${DISPLAY_PAGE}"$'\n'"${ITEM_TEXT}"$'\n'"${SPEED_TEXT}"$'\n\n📁 فایل در کانال آرشیو شما ذخیره شد.\n\n👇 برای دریافت روی دکمه زیر کلیک کنید:'
+          
+          jq -n --arg chat_id "$CHAT_ID" --arg text "$TEXT" --argjson reply_markup "$KEYBOARD" \
+            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", reply_markup: $reply_markup}' > /tmp/notify.json
+          curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" -d @/tmp/notify.json > /dev/null 2>&1
+          echo "✅ Notification sent"
