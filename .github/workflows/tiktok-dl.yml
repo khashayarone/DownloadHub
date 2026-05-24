@@ -1,19 +1,20 @@
 # ============================================================
-# tiktok-dl.yml — Bale TikTok Downloader V1
+# tiktok-dl.yml — Bale TikTok Downloader V2
 # Repository: github.com/khashayardev/DownloadHub
 # ============================================================
-# Features:
+# Features V2:
 #   ۱. Download videos without watermark
 #   ۲. Auto-organize by creator name (folder = creator slug)
 #   ۳. Cache system — instant skip if already downloaded
-#   ۴. Metadata embedding + thumbnail artwork
-#   ۵. Rich creator info in creator_info.json
-#   ۶. Auto-generated README.md per creator with stats
-#   ۷. Thumbnail photo + Persian caption sent to user
-#   ۸. Video sent via sendVideo
-#   ۹. Quality Gate: auto-downgrade if >2GB
-#   ۱۰. 3 download methods (WARP proxy, direct, UA spoof)
+#   ۴. Quality mapping: 720→best, 480→medium
+#   ۵. Metadata embedding + thumbnail artwork
+#   ۶. Rich creator info in creator_info.json
+#   ۷. Auto-generated README.md per creator with stats
+#   ۸. Combined single message (thumbnail + caption + channel link + back button)
+#   ۹. Video sent via sendVideo to archive channel
+#   ۱۰. 2 download methods (WARP proxy + direct fallback)
 #   ۱۱. Multi-URL input support
+#   ۱۲. Compatible with Bale DownloadHub Bot v3
 # ============================================================
 
 name: "🎵 TikTok Downloader"
@@ -26,14 +27,13 @@ on:
         required: true
         type: string
       quality:
-        description: "📹 Video Quality"
+        description: "📹 Video Quality (720=best, 480=medium)"
         required: false
         type: choice
-        default: "best"
+        default: "720"
         options:
-          - best
-          - high
-          - medium
+          - "720"
+          - "480"
       download_type:
         description: "📋 Download Type"
         required: false
@@ -137,6 +137,7 @@ jobs:
           QUALITY="${TT_QUALITY}"
           DOWNLOAD_TYPE="${TT_TYPE}"
           MAX_ITEMS="${TT_MAX}"
+          BRANCH="${BRANCH}"
           
           echo "════════════════════════════════════════"
           echo "  $PROJECT_NAME | $PROJECT_URL"
@@ -144,11 +145,13 @@ jobs:
           echo "🎵 URLs: ${TT_URLS}"
           echo "📹 Quality: ${QUALITY}"
           echo "📋 Type: ${DOWNLOAD_TYPE} | Max: ${MAX_ITEMS}"
+          echo "🌿 Branch: ${BRANCH}"
           
           echo "TT_URLS=${TT_URLS}" >> $GITHUB_ENV
           echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
           echo "DOWNLOAD_TYPE=${DOWNLOAD_TYPE}" >> $GITHUB_ENV
           echo "MAX_ITEMS=${MAX_ITEMS}" >> $GITHUB_ENV
+          echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
           echo "REPO_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
           echo "BACKUP_DIR=/tmp/tt_downloads_$$" >> $GITHUB_ENV
           echo "CACHE_INDEX=${GITHUB_WORKSPACE}/tiktok/cache_index.json" >> $GITHUB_ENV
@@ -160,11 +163,11 @@ jobs:
             echo '{}' > "${GITHUB_WORKSPACE}/tiktok/cache_index.json"
           fi
           
+          # Quality mapping: 720 → best, 480 → medium
           case "${QUALITY}" in
-            best)   FORMAT="best/bestvideo+bestaudio/best" ;;
-            high)   FORMAT="best[height<=1080]/bestvideo[height<=1080]+bestaudio/best" ;;
-            medium) FORMAT="best[height<=720]/bestvideo[height<=720]+bestaudio/best" ;;
-            *)      FORMAT="best/bestvideo+bestaudio/best" ;;
+            720)   FORMAT="best/bestvideo+bestaudio/best" ;;
+            480)   FORMAT="best[height<=720]/bestvideo[height<=720]+bestaudio/best" ;;
+            *)     FORMAT="best/bestvideo+bestaudio/best" ;;
           esac
           echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
           
@@ -197,6 +200,7 @@ jobs:
               echo "CACHED_CREATOR=$(jq -r ".\"${VIDEO_ID}\".creator // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
               echo "CACHED_TITLE=$(jq -r ".\"${VIDEO_ID}\".title // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
               echo "CACHED_THUMB=$(jq -r ".\"${VIDEO_ID}\".thumbnail // \"\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+              echo "CACHED_VIEWS=$(jq -r ".\"${VIDEO_ID}\".views // 0" "$CACHE_INDEX")" >> $GITHUB_ENV
             else
               echo "🆕 Not in cache"
               echo "CACHE_HIT=false" >> $GITHUB_ENV
@@ -325,7 +329,8 @@ jobs:
             
             CACHE_ENTRY=$(jq -n --arg path "tiktok/${CREATOR_SLUG}/${SAFE_NAME}.${EXT}" \
               --arg creator "$CREATOR" --arg title "$TITLE" --arg thumbnail "$THUMBNAIL_URL" \
-              '{path: $path, creator: $creator, title: $title, thumbnail: $thumbnail, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
+              --argjson views "${VIEW_COUNT:-0}" \
+              '{path: $path, creator: $creator, title: $title, thumbnail: $thumbnail, views: $views, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
             jq --arg id "$VIDEO_ID" --argjson entry "$CACHE_ENTRY" '. + {($id): $entry}' "$CACHE_INDEX" > /tmp/cache_tmp.json
             mv /tmp/cache_tmp.json "$CACHE_INDEX"
             echo "  💾 Cached: $VIDEO_ID"
@@ -371,15 +376,16 @@ jobs:
           CREATOR: ${{ env.CREATOR }}
           TRACK_TITLE: ${{ env.TRACK_TITLE }}
           REPO_DIR: ${{ env.REPO_DIR }}
+          BRANCH: ${{ env.BRANCH }}
         run: |
           cd "$REPO_DIR"
           git add tiktok/
           if git diff --staged --quiet; then
             echo "✅ No changes"
           else
-            git commit -m "feat(tiktok): add $CREATOR — $TRACK_TITLE"
-            git pull --rebase origin main || true
-            git push origin main
+            git commit -m "feat(tiktok): add ${CREATOR} — ${TRACK_TITLE}"
+            git pull --rebase origin ${BRANCH} || true
+            git push origin ${BRANCH}
             echo "✅ Pushed"
           fi
 
@@ -391,9 +397,9 @@ jobs:
           docker rm warp 2>/dev/null || true
 
       # ═══════════════════════════════════════════════════
-      # Step 10: Send Video Info to User
+      # Step 10: Send Combined Message (Video Info + Channel Link + Back Button)
       # ═══════════════════════════════════════════════════
-      - name: "🖼️ Send Video Info to User"
+      - name: "📬 Send Complete Result to User"
         if: github.event.inputs.chat_id != ''
         env:
           BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
@@ -404,25 +410,48 @@ jobs:
           DURATION: ${{ env.DURATION }}
           VIEW_COUNT: ${{ env.VIEW_COUNT }}
           THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
           CACHE_HIT: ${{ env.CACHE_HIT }}
           CACHED_CREATOR: ${{ env.CACHED_CREATOR }}
           CACHED_TITLE: ${{ env.CACHED_TITLE }}
           CACHED_THUMB: ${{ env.CACHED_THUMB }}
+          CACHED_VIEWS: ${{ env.CACHED_VIEWS }}
+          VIDEO_COUNT: ${{ env.VIDEO_COUNT }}
         run: |
           #!/bin/bash
+          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          
+          # ── Determine which data to use (cache vs fresh) ──
           if [ "$CACHE_HIT" = "true" ]; then
-            CREATOR_NAME="$CACHED_CREATOR"
-            TITLE_NAME="$CACHED_TITLE"
-            THUMB_URL="$CACHED_THUMB"
-            VIEW_VAL="0"
+            CREATOR_NAME="${CACHED_CREATOR:-Unknown}"
+            TITLE_NAME="${CACHED_TITLE:-Untitled}"
+            THUMB_URL="${CACHED_THUMB:-}"
+            DURATION_VAL="0"
+            VIEW_VAL="${CACHED_VIEWS:-0}"
+            VIDEO_COUNT_VAL="1"
+            SPEED_TEXT="⚡ از حافظه کش ارسال شد | "
           else
-            CREATOR_NAME="$CREATOR"
-            TITLE_NAME="$TRACK_TITLE"
-            THUMB_URL="$THUMBNAIL_URL"
-            VIEW_VAL="$VIEW_COUNT"
+            CREATOR_NAME="${CREATOR:-Unknown}"
+            TITLE_NAME="${TRACK_TITLE:-Untitled}"
+            THUMB_URL="${THUMBNAIL_URL:-}"
+            DURATION_VAL="${DURATION:-0}"
+            VIEW_VAL="${VIEW_COUNT:-0}"
+            VIDEO_COUNT_VAL="${VIDEO_COUNT:-1}"
+            SPEED_TEXT=""
           fi
           
-          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
+          # ── Format duration ──
+          if [ "$DURATION_VAL" -gt 0 ] 2>/dev/null; then
+            DUR_MIN=$(( DURATION_VAL / 60 ))
+            DUR_REM=$(( DURATION_VAL % 60 ))
+            DUR_FMT="${DUR_MIN}:$(printf '%02d' $DUR_REM)"
+          else
+            DUR_FMT="—"
+          fi
+          
+          # ── Format views ──
+          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" != "null" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
             if [ "$VIEW_VAL" -gt 1000000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000000" | bc)M"
             elif [ "$VIEW_VAL" -gt 1000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000" | bc)K"
             else VIEWS_FMT="$VIEW_VAL"; fi
@@ -430,29 +459,82 @@ jobs:
             VIEWS_FMT="—"
           fi
           
+          # ── Build channel link ──
+          if [ -n "$CHANNEL_USERNAME" ]; then
+            CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
+          elif [ -n "$CHANNEL_ID" ]; then
+            CHANNEL_LINK="https://ble.ir/im/p/${CHANNEL_ID}"
+          else
+            CHANNEL_LINK="https://ble.ir"
+          fi
+          
+          # ── Build caption (combined: video info + completion notice) ──
           CAPTION="🎵 *${TITLE_NAME}*
-
+          
           👤 *سازنده:* ${CREATOR_NAME}
-          👁 *بازدید:* ${VIEWS_FMT}
-
+          ⏱ *مدت:* ${DUR_FMT}  |  👁 *بازدید:* ${VIEWS_FMT}
+          
+          ✅ *دانلود کامل شد!* ${SPEED_TEXT}🎵 *تعداد:* ${VIDEO_COUNT_VAL}
+          📁 فایل در کانال آرشیو شما ذخیره شد.
+          
           🔗 [مشاهده در TikTok](${TT_URLS})"
           
+          # ── Build keyboard with channel link + back button ──
+          KEYBOARD=$(jq -n \
+            --arg channel_url "$CHANNEL_LINK" \
+            '{
+              inline_keyboard: [
+                [{text: "📂 دریافت فایل از کانال آرشیو", url: $channel_url}],
+                [{text: "🔙 بازگشت به منوی اصلی", callback_data: "back_to_main"}]
+              ]
+            }')
+          
+          # Escape for JSON
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -R -s '.')
+          ESCAPED_KEYBOARD=$(echo "$KEYBOARD" | jq -c '.')
+          
+          # ── Send as photo with caption (if thumbnail exists) ──
           PHOTO_SENT=false
           if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg photo "$THUMB_URL" --arg caption "$CAPTION" \
-              '{chat_id: $chat_id, photo: $photo, caption: $caption, parse_mode: "Markdown"}' > /tmp/photo_payload.json
-            PHOTO_RESPONSE=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendPhoto" \
-              -H "Content-Type: application/json" -d @/tmp/photo_payload.json)
-            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then PHOTO_SENT=true; fi
+            echo "🖼️ Sending photo with caption via JSON..."
+            PHOTO_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendPhoto" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"photo\": \"${THUMB_URL}\",
+                \"caption\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              PHOTO_SENT=true
+              echo "  ✅ Photo sent successfully"
+            else
+              echo "  ⚠️ Photo failed, trying text fallback..."
+            fi
           fi
           
+          # ── Fallback: send as text message via JSON ──
           if [ "$PHOTO_SENT" = false ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg text "$CAPTION" \
-              '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' > /tmp/text_payload.json
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" -d @/tmp/text_payload.json > /dev/null 2>&1
+            echo "📝 Sending as text message via JSON..."
+            TEXT_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"text\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$TEXT_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              echo "  ✅ Text sent successfully"
+            else
+              echo "  ❌ Text also failed: $TEXT_RESPONSE"
+            fi
           fi
-          echo "✅ Video info sent"
+          
+          echo "✅ Complete result sent to user"
 
       # ═══════════════════════════════════════════════════
       # Step 11: Upload Video to Channel
@@ -476,7 +558,7 @@ jobs:
             FILENAME=$(basename "$FILE_PATH")
             echo "  📄 Uploading from cache: $FILENAME"
             curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-              -F "video=@${FILE_PATH}" -F "caption=🎵 ${FILENAME%.*} | TikTok" > /dev/null 2>&1
+              -F "video=@${FILE_PATH}" -F "caption=" > /dev/null 2>&1
             echo "    ✅ Uploaded"
           else
             for CREATOR_FOLDER in "$BACKUP_DIR"/*/ ; do
@@ -487,59 +569,10 @@ jobs:
                 FILENAME=$(basename "$FILE")
                 echo "  📄 Uploading: $FILENAME"
                 curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-                  -F "video=@${FILE}" -F "caption=🎵 ${CREATOR_NAME} — ${FILENAME%.*} | TikTok" > /dev/null 2>&1
+                  -F "video=@${FILE}" -F "caption=" > /dev/null 2>&1
                 echo "    ✅ Uploaded"
                 sleep 3
               done
             done
           fi
           echo "✅ All videos uploaded"
-
-      # ═══════════════════════════════════════════════════
-      # Step 12: Notify User
-      # ═══════════════════════════════════════════════════
-      - name: "📬 Notify User"
-        if: github.event.inputs.chat_id != ''
-        env:
-          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
-          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
-          CREATOR: ${{ env.CREATOR }}
-          CACHED_CREATOR: ${{ env.CACHED_CREATOR }}
-          VIDEO_COUNT: ${{ env.VIDEO_COUNT }}
-          CACHE_HIT: ${{ env.CACHE_HIT }}
-        run: |
-          #!/bin/bash
-          if [ "$CACHE_HIT" = "true" ]; then
-            DISPLAY_CREATOR="$CACHED_CREATOR"
-            SPEED_TEXT="⚡ *از حافظه کش ارسال شد!*"
-            VIDEO_COUNT_VAL="1"
-          else
-            DISPLAY_CREATOR="$CREATOR"
-            SPEED_TEXT=""
-            VIDEO_COUNT_VAL="${VIDEO_COUNT:-1}"
-          fi
-          
-          if [ -n "$CHANNEL_USERNAME" ]; then
-            CHANNEL_LINK="https://ble.ir/$CHANNEL_USERNAME"
-          elif [ -n "$CHANNEL_ID" ]; then
-            CHANNEL_LINK="https://ble.ir/im/p/$CHANNEL_ID"
-          else
-            CHANNEL_LINK=""
-          fi
-          
-          if [ -n "$CHANNEL_LINK" ]; then
-            KEYBOARD=$(jq -n --arg url "$CHANNEL_LINK" \
-              '{inline_keyboard: [[{text: "📂 مشاهده و دریافت فایل", url: $url}]]}')
-          else
-            KEYBOARD='{"inline_keyboard": []}'
-          fi
-          
-          TEXT=$'✅ *دانلود از TikTok کامل شد!*\n\n👤 *سازنده:* '"${DISPLAY_CREATOR}"$'\n🎵 *تعداد ویدیو:* '"${VIDEO_COUNT_VAL}"$'\n'"${SPEED_TEXT}"$'\n\n📁 فایل در کانال آرشیو شما ذخیره شد.\n\n👇 برای دریافت روی دکمه زیر کلیک کنید:'
-          
-          jq -n --arg chat_id "$CHAT_ID" --arg text "$TEXT" --argjson reply_markup "$KEYBOARD" \
-            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", reply_markup: $reply_markup}' > /tmp/notify.json
-          curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" -d @/tmp/notify.json > /dev/null 2>&1
-          echo "✅ Notification sent"
