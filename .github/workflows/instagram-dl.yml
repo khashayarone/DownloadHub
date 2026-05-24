@@ -1,20 +1,20 @@
 # ============================================================
-# instagram-dl.yml — Bale Instagram Downloader V1
+# instagram-dl.yml — Bale Instagram Downloader V2
 # Repository: github.com/khashayardev/DownloadHub
 # ============================================================
-# Features:
+# Features V2:
 #   ۱. Download posts, reels, stories, IGTV
 #   ۲. Auto-organize by username (folder = username slug)
 #   ۳. Cache system — instant skip if already downloaded
-#   ۴. Multiple output formats (mp4, jpg, png)
+#   ۴. Quality mapping: 720→best, 480→medium
 #   ۵. Metadata embedding + thumbnail artwork
 #   ۶. Rich creator info in creator_info.json
 #   ۷. Auto-generated README.md per creator with stats
-#   ۸. Thumbnail photo + Persian caption sent to user
-#   ۹. Video sent via sendVideo / photo via sendPhoto
-#   ۱۰. Quality Gate: auto-downgrade if >2GB
-#   ۱۱. 3 download methods (WARP proxy, direct, UA spoof)
-#   ۱۲. Multi-URL input support
+#   ۸. Combined single message (thumbnail + caption + channel link + back button)
+#   ۹. Video sent via sendVideo to archive channel
+#   ۱۰. 2 download methods (WARP proxy + direct fallback)
+#   ۱۱. Multi-URL input support
+#   ۱۲. Compatible with Bale DownloadHub Bot v3
 # ============================================================
 
 name: "📸 Instagram Downloader"
@@ -27,14 +27,13 @@ on:
         required: true
         type: string
       quality:
-        description: "📸 Media Quality"
+        description: "📸 Media Quality (720=best, 480=medium)"
         required: false
         type: choice
-        default: "best"
+        default: "720"
         options:
-          - best
-          - high
-          - medium
+          - "720"
+          - "480"
       format_choice:
         description: "📁 Output Format (video)"
         required: false
@@ -148,6 +147,7 @@ jobs:
           FORMAT_CHOICE="${IG_FORMAT}"
           DOWNLOAD_TYPE="${IG_TYPE}"
           MAX_ITEMS="${IG_MAX}"
+          BRANCH="${BRANCH}"
           
           echo "════════════════════════════════════════"
           echo "  $PROJECT_NAME | $PROJECT_URL"
@@ -155,12 +155,14 @@ jobs:
           echo "📸 URLs: ${IG_URLS}"
           echo "📊 Quality: ${QUALITY} | Format: ${FORMAT_CHOICE}"
           echo "📋 Type: ${DOWNLOAD_TYPE} | Max: ${MAX_ITEMS}"
+          echo "🌿 Branch: ${BRANCH}"
           
           echo "IG_URLS=${IG_URLS}" >> $GITHUB_ENV
           echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
           echo "FORMAT_CHOICE=${FORMAT_CHOICE}" >> $GITHUB_ENV
           echo "DOWNLOAD_TYPE=${DOWNLOAD_TYPE}" >> $GITHUB_ENV
           echo "MAX_ITEMS=${MAX_ITEMS}" >> $GITHUB_ENV
+          echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
           echo "REPO_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
           echo "BACKUP_DIR=/tmp/ig_downloads_$$" >> $GITHUB_ENV
           echo "CACHE_INDEX=${GITHUB_WORKSPACE}/instagram/cache_index.json" >> $GITHUB_ENV
@@ -172,11 +174,11 @@ jobs:
             echo '{}' > "${GITHUB_WORKSPACE}/instagram/cache_index.json"
           fi
           
+          # Quality mapping: 720 → best, 480 → medium
           case "${QUALITY}" in
-            best)   FORMAT="best/bestvideo+bestaudio/best" ;;
-            high)   FORMAT="best[height<=1080]/bestvideo[height<=1080]+bestaudio/best" ;;
-            medium) FORMAT="best[height<=720]/bestvideo[height<=720]+bestaudio/best" ;;
-            *)      FORMAT="best/bestvideo+bestaudio/best" ;;
+            720)   FORMAT="best/bestvideo+bestaudio/best" ;;
+            480)   FORMAT="best[height<=720]/bestvideo[height<=720]+bestaudio/best" ;;
+            *)     FORMAT="best/bestvideo+bestaudio/best" ;;
           esac
           echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
           
@@ -391,15 +393,16 @@ jobs:
           USERNAME: ${{ env.USERNAME }}
           TRACK_TITLE: ${{ env.TRACK_TITLE }}
           REPO_DIR: ${{ env.REPO_DIR }}
+          BRANCH: ${{ env.BRANCH }}
         run: |
           cd "$REPO_DIR"
           git add instagram/
           if git diff --staged --quiet; then
             echo "✅ No changes"
           else
-            git commit -m "feat(instagram): add $USERNAME — $TRACK_TITLE"
-            git pull --rebase origin main || true
-            git push origin main
+            git commit -m "feat(instagram): add ${USERNAME} — ${TRACK_TITLE}"
+            git pull --rebase origin ${BRANCH} || true
+            git push origin ${BRANCH}
             echo "✅ Pushed"
           fi
 
@@ -411,9 +414,9 @@ jobs:
           docker rm warp 2>/dev/null || true
 
       # ═══════════════════════════════════════════════════
-      # Step 10: Send Media Info to User
+      # Step 10: Send Combined Message (Media Info + Channel Link + Back Button)
       # ═══════════════════════════════════════════════════
-      - name: "🖼️ Send Media Info to User"
+      - name: "📬 Send Complete Result to User"
         if: github.event.inputs.chat_id != ''
         env:
           BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
@@ -424,25 +427,47 @@ jobs:
           DURATION: ${{ env.DURATION }}
           LIKE_COUNT: ${{ env.LIKE_COUNT }}
           THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
           CACHE_HIT: ${{ env.CACHE_HIT }}
           CACHED_USERNAME: ${{ env.CACHED_USERNAME }}
           CACHED_TITLE: ${{ env.CACHED_TITLE }}
           CACHED_THUMB: ${{ env.CACHED_THUMB }}
+          ITEM_COUNT: ${{ env.ITEM_COUNT }}
         run: |
           #!/bin/bash
+          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          
+          # ── Determine which data to use (cache vs fresh) ──
           if [ "$CACHE_HIT" = "true" ]; then
-            USER_NAME="$CACHED_USERNAME"
-            TITLE_NAME="$CACHED_TITLE"
-            THUMB_URL="$CACHED_THUMB"
+            USER_NAME="${CACHED_USERNAME:-Unknown}"
+            TITLE_NAME="${CACHED_TITLE:-Untitled}"
+            THUMB_URL="${CACHED_THUMB:-}"
             LIKE_VAL="0"
+            DURATION_VAL="0"
+            ITEM_COUNT_VAL="1"
+            SPEED_TEXT="⚡ از حافظه کش ارسال شد | "
           else
-            USER_NAME="$USERNAME"
-            TITLE_NAME="$TRACK_TITLE"
-            THUMB_URL="$THUMBNAIL_URL"
-            LIKE_VAL="$LIKE_COUNT"
+            USER_NAME="${USERNAME:-Unknown}"
+            TITLE_NAME="${TRACK_TITLE:-Untitled}"
+            THUMB_URL="${THUMBNAIL_URL:-}"
+            LIKE_VAL="${LIKE_COUNT:-0}"
+            DURATION_VAL="${DURATION:-0}"
+            ITEM_COUNT_VAL="${ITEM_COUNT:-1}"
+            SPEED_TEXT=""
           fi
           
-          if [ "$LIKE_VAL" != "0" ] && [ "$LIKE_VAL" -gt 0 ] 2>/dev/null; then
+          # ── Format duration ──
+          if [ "$DURATION_VAL" -gt 0 ] 2>/dev/null; then
+            DUR_MIN=$(( DURATION_VAL / 60 ))
+            DUR_REM=$(( DURATION_VAL % 60 ))
+            DUR_FMT="${DUR_MIN}:$(printf '%02d' $DUR_REM)"
+          else
+            DUR_FMT="—"
+          fi
+          
+          # ── Format likes ──
+          if [ "$LIKE_VAL" != "0" ] && [ "$LIKE_VAL" != "null" ] && [ "$LIKE_VAL" -gt 0 ] 2>/dev/null; then
             if [ "$LIKE_VAL" -gt 1000000 ]; then LIKES_FMT="$(echo "scale=1; $LIKE_VAL / 1000000" | bc)M"
             elif [ "$LIKE_VAL" -gt 1000 ]; then LIKES_FMT="$(echo "scale=1; $LIKE_VAL / 1000" | bc)K"
             else LIKES_FMT="$LIKE_VAL"; fi
@@ -450,29 +475,82 @@ jobs:
             LIKES_FMT="—"
           fi
           
+          # ── Build channel link ──
+          if [ -n "$CHANNEL_USERNAME" ]; then
+            CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
+          elif [ -n "$CHANNEL_ID" ]; then
+            CHANNEL_LINK="https://ble.ir/im/p/${CHANNEL_ID}"
+          else
+            CHANNEL_LINK="https://ble.ir"
+          fi
+          
+          # ── Build caption (combined: media info + completion notice) ──
           CAPTION="📸 *${TITLE_NAME}*
-
+          
           👤 *کاربر:* ${USER_NAME}
-          ❤️ *لایک:* ${LIKES_FMT}
-
+          ⏱ *مدت:* ${DUR_FMT}  |  ❤️ *لایک:* ${LIKES_FMT}
+          
+          ✅ *دانلود کامل شد!* ${SPEED_TEXT}📸 *تعداد:* ${ITEM_COUNT_VAL}
+          📁 فایل در کانال آرشیو شما ذخیره شد.
+          
           🔗 [مشاهده در Instagram](${IG_URLS})"
           
+          # ── Build keyboard with channel link + back button ──
+          KEYBOARD=$(jq -n \
+            --arg channel_url "$CHANNEL_LINK" \
+            '{
+              inline_keyboard: [
+                [{text: "📂 دریافت فایل از کانال آرشیو", url: $channel_url}],
+                [{text: "🔙 بازگشت به منوی اصلی", callback_data: "back_to_main"}]
+              ]
+            }')
+          
+          # Escape for JSON
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -R -s '.')
+          ESCAPED_KEYBOARD=$(echo "$KEYBOARD" | jq -c '.')
+          
+          # ── Send as photo with caption (if thumbnail exists) ──
           PHOTO_SENT=false
           if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg photo "$THUMB_URL" --arg caption "$CAPTION" \
-              '{chat_id: $chat_id, photo: $photo, caption: $caption, parse_mode: "Markdown"}' > /tmp/photo_payload.json
-            PHOTO_RESPONSE=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendPhoto" \
-              -H "Content-Type: application/json" -d @/tmp/photo_payload.json)
-            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then PHOTO_SENT=true; fi
+            echo "🖼️ Sending photo with caption via JSON..."
+            PHOTO_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendPhoto" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"photo\": \"${THUMB_URL}\",
+                \"caption\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              PHOTO_SENT=true
+              echo "  ✅ Photo sent successfully"
+            else
+              echo "  ⚠️ Photo failed, trying text fallback..."
+            fi
           fi
           
+          # ── Fallback: send as text message via JSON ──
           if [ "$PHOTO_SENT" = false ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg text "$CAPTION" \
-              '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' > /tmp/text_payload.json
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" -d @/tmp/text_payload.json > /dev/null 2>&1
+            echo "📝 Sending as text message via JSON..."
+            TEXT_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"text\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$TEXT_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              echo "  ✅ Text sent successfully"
+            else
+              echo "  ❌ Text also failed: $TEXT_RESPONSE"
+            fi
           fi
-          echo "✅ Media info sent"
+          
+          echo "✅ Complete result sent to user"
 
       # ═══════════════════════════════════════════════════
       # Step 11: Upload Media to Channel
@@ -497,10 +575,10 @@ jobs:
             echo "  📄 Uploading from cache: $FILENAME"
             if [[ "$FILENAME" == *.mp4 ]] || [[ "$FILENAME" == *.mkv ]]; then
               curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-                -F "video=@${FILE_PATH}" -F "caption=📸 ${FILENAME%.*} | Instagram" > /dev/null 2>&1
+                -F "video=@${FILE_PATH}" -F "caption=" > /dev/null 2>&1
             else
               curl -s -X POST "${BALE_API_URL}/sendDocument" -F "chat_id=${CHANNEL_ID}" \
-                -F "document=@${FILE_PATH}" -F "caption=📸 ${FILENAME%.*} | Instagram" > /dev/null 2>&1
+                -F "document=@${FILE_PATH}" -F "caption=" > /dev/null 2>&1
             fi
             echo "    ✅ Uploaded"
           else
@@ -514,10 +592,10 @@ jobs:
                 echo "  📄 Uploading: $FILENAME"
                 if [[ "$FILENAME" == *.mp4 ]] || [[ "$FILENAME" == *.mkv ]]; then
                   curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-                    -F "video=@${FILE}" -F "caption=📸 ${USER_NAME} — ${FILENAME%.*} | Instagram" > /dev/null 2>&1
+                    -F "video=@${FILE}" -F "caption=" > /dev/null 2>&1
                 else
                   curl -s -X POST "${BALE_API_URL}/sendDocument" -F "chat_id=${CHANNEL_ID}" \
-                    -F "document=@${FILE}" -F "caption=📸 ${USER_NAME} — ${FILENAME%.*} | Instagram" > /dev/null 2>&1
+                    -F "document=@${FILE}" -F "caption=" > /dev/null 2>&1
                 fi
                 echo "    ✅ Uploaded"
                 sleep 3
@@ -525,52 +603,3 @@ jobs:
             done
           fi
           echo "✅ All media files uploaded"
-
-      # ═══════════════════════════════════════════════════
-      # Step 12: Notify User
-      # ═══════════════════════════════════════════════════
-      - name: "📬 Notify User"
-        if: github.event.inputs.chat_id != ''
-        env:
-          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
-          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
-          USERNAME: ${{ env.USERNAME }}
-          CACHED_USERNAME: ${{ env.CACHED_USERNAME }}
-          ITEM_COUNT: ${{ env.ITEM_COUNT }}
-          CACHE_HIT: ${{ env.CACHE_HIT }}
-        run: |
-          #!/bin/bash
-          if [ "$CACHE_HIT" = "true" ]; then
-            DISPLAY_USER="$CACHED_USERNAME"
-            SPEED_TEXT="⚡ *از حافظه کش ارسال شد!*"
-            ITEM_COUNT_VAL="1"
-          else
-            DISPLAY_USER="$USERNAME"
-            SPEED_TEXT=""
-            ITEM_COUNT_VAL="${ITEM_COUNT:-1}"
-          fi
-          
-          if [ -n "$CHANNEL_USERNAME" ]; then
-            CHANNEL_LINK="https://ble.ir/$CHANNEL_USERNAME"
-          elif [ -n "$CHANNEL_ID" ]; then
-            CHANNEL_LINK="https://ble.ir/im/p/$CHANNEL_ID"
-          else
-            CHANNEL_LINK=""
-          fi
-          
-          if [ -n "$CHANNEL_LINK" ]; then
-            KEYBOARD=$(jq -n --arg url "$CHANNEL_LINK" \
-              '{inline_keyboard: [[{text: "📂 مشاهده و دریافت فایل", url: $url}]]}')
-          else
-            KEYBOARD='{"inline_keyboard": []}'
-          fi
-          
-          TEXT=$'✅ *دانلود از Instagram کامل شد!*\n\n👤 *کاربر:* '"${DISPLAY_USER}"$'\n📸 *تعداد آیتم:* '"${ITEM_COUNT_VAL}"$'\n'"${SPEED_TEXT}"$'\n\n📁 فایل در کانال آرشیو شما ذخیره شد.\n\n👇 برای دریافت روی دکمه زیر کلیک کنید:'
-          
-          jq -n --arg chat_id "$CHAT_ID" --arg text "$TEXT" --argjson reply_markup "$KEYBOARD" \
-            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", reply_markup: $reply_markup}' > /tmp/notify.json
-          curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" -d @/tmp/notify.json > /dev/null 2>&1
-          echo "✅ Notification sent"
