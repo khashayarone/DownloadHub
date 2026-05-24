@@ -1,20 +1,21 @@
 # ============================================================
-# facebook-dl.yml — Bale Facebook Downloader V1
+# facebook-dl.yml — Bale Facebook Downloader V2
 # Repository: github.com/khashayardev/DownloadHub
 # ============================================================
-# Features:
+# Features V2:
 #   ۱. Download videos from Facebook (Watch, Reels, posts)
 #   ۲. Auto-organize by page/creator name (folder = page slug)
 #   ۳. Cache system — instant skip if already downloaded
-#   ۴. Metadata embedding + thumbnail artwork
-#   ۵. Rich page info in page_info.json
-#   ۶. Auto-generated README.md per page with stats
-#   ۷. Thumbnail photo + Persian caption sent to user
-#   ۸. Video via sendVideo to Bale channel
-#   ۹. Quality Gate: auto-downgrade if >2GB
-#   ۱۰. 3 download methods (WARP proxy, direct, UA spoof)
-#   ۱۱. Multi-URL input support
-#   ۱۲. Text post detection — extract & send text
+#   ۴. Quality mapping: 720→best, 480→medium
+#   ۵. Metadata embedding + thumbnail artwork
+#   ۶. Rich page info in page_info.json
+#   ۷. Auto-generated README.md per page with stats
+#   ۸. Combined single message (thumbnail + caption + channel link + back button)
+#   ۹. Video via sendVideo / text post via sendMessage to archive channel
+#   ۱۰. Text post detection — extract & send text separately
+#   ۱۱. 2 download methods (WARP proxy + direct fallback)
+#   ۱۲. Multi-URL input support
+#   ۱۳. Compatible with Bale DownloadHub Bot v3
 # ============================================================
 
 name: "📘 Facebook Downloader"
@@ -27,14 +28,13 @@ on:
         required: true
         type: string
       quality:
-        description: "📹 Video Quality"
+        description: "📹 Video Quality (720=best, 480=medium)"
         required: false
         type: choice
-        default: "best"
+        default: "720"
         options:
-          - best
-          - high
-          - medium
+          - "720"
+          - "480"
       download_type:
         description: "📋 Download Type"
         required: false
@@ -138,6 +138,7 @@ jobs:
           QUALITY="${FB_QUALITY}"
           DOWNLOAD_TYPE="${FB_TYPE}"
           MAX_ITEMS="${FB_MAX}"
+          BRANCH="${BRANCH}"
           
           echo "════════════════════════════════════════"
           echo "  $PROJECT_NAME | $PROJECT_URL"
@@ -145,11 +146,13 @@ jobs:
           echo "📘 URLs: ${FB_URLS}"
           echo "📹 Quality: ${QUALITY}"
           echo "📋 Type: ${DOWNLOAD_TYPE} | Max: ${MAX_ITEMS}"
+          echo "🌿 Branch: ${BRANCH}"
           
           echo "FB_URLS=${FB_URLS}" >> $GITHUB_ENV
           echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
           echo "DOWNLOAD_TYPE=${DOWNLOAD_TYPE}" >> $GITHUB_ENV
           echo "MAX_ITEMS=${MAX_ITEMS}" >> $GITHUB_ENV
+          echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
           echo "REPO_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
           echo "BACKUP_DIR=/tmp/fb_downloads_$$" >> $GITHUB_ENV
           echo "CACHE_INDEX=${GITHUB_WORKSPACE}/facebook/cache_index.json" >> $GITHUB_ENV
@@ -161,11 +164,11 @@ jobs:
             echo '{}' > "${GITHUB_WORKSPACE}/facebook/cache_index.json"
           fi
           
+          # Quality mapping: 720 → best, 480 → medium
           case "${QUALITY}" in
-            best)   FORMAT="best/bestvideo+bestaudio/best" ;;
-            high)   FORMAT="best[height<=1080]/bestvideo[height<=1080]+bestaudio/best" ;;
-            medium) FORMAT="best[height<=720]/bestvideo[height<=720]+bestaudio/best" ;;
-            *)      FORMAT="best/bestvideo+bestaudio/best" ;;
+            720)   FORMAT="best/bestvideo+bestaudio/best" ;;
+            480)   FORMAT="best[height<=720]/bestvideo[height<=720]+bestaudio/best" ;;
+            *)     FORMAT="best/bestvideo+bestaudio/best" ;;
           esac
           echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
           
@@ -198,6 +201,9 @@ jobs:
               echo "CACHED_PAGE=$(jq -r ".\"${VIDEO_ID}\".page // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
               echo "CACHED_TITLE=$(jq -r ".\"${VIDEO_ID}\".title // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
               echo "CACHED_THUMB=$(jq -r ".\"${VIDEO_ID}\".thumbnail // \"\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+              echo "CACHED_TEXT=$(jq -r ".\"${VIDEO_ID}\".text // \"\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+              echo "CACHED_MEDIA_TYPE=$(jq -r ".\"${VIDEO_ID}\".media_type // \"video\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+              echo "CACHED_VIEWS=$(jq -r ".\"${VIDEO_ID}\".views // 0" "$CACHE_INDEX")" >> $GITHUB_ENV
             else
               echo "🆕 Not in cache"
               echo "CACHE_HIT=false" >> $GITHUB_ENV
@@ -313,7 +319,7 @@ jobs:
             echo "  📝 Saved post text: ${ITEM_SLUG}_post.txt"
           fi
           
-          # For text-only posts: skip download, send text
+          # For text-only posts: skip download, save metadata
           if [ "$MEDIA_TYPE" = "text" ]; then
             echo "  📝 Text-only post — saving text, skipping media download"
             
@@ -324,29 +330,16 @@ jobs:
               > "${PAGE_DIR}/${ITEM_SLUG}_info.json"
             echo "  📋 Saved post info: ${ITEM_SLUG}_info.json"
             
-            if [ -n "$CHAT_ID" ] && [ -n "$BALE_TOKEN" ]; then
-              TEXT_PREVIEW=$(truncate_text "$POST_TEXT" 350)
-              TEXT_MSG="📘 *پست از ${PAGE_NAME}*
-
-          ${TEXT_PREVIEW}
-
-          👁 *بازدید:* $(format_number $VIEW_COUNT) | ❤️ *لایک:* $(format_number $LIKE_COUNT) | 💬 *کامنت:* $(format_number $COMMENT_COUNT)
-
-          🔗 [مشاهده در Facebook](${FB_URL})"
-              
-              jq -n --arg chat_id "$CHAT_ID" --arg text "$TEXT_MSG" \
-                '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' > /tmp/fb_text_payload.json
-              curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-                -H "Content-Type: application/json" -d @/tmp/fb_text_payload.json > /dev/null 2>&1
-              echo "  📤 Sent post text to user"
-            fi
-            
             echo "PAGE_NAME=${PAGE_NAME}" >> $GITHUB_ENV
             echo "PAGE_SLUG=${PAGE_SLUG}" >> $GITHUB_ENV
             echo "TRACK_TITLE=${TITLE}" >> $GITHUB_ENV
             echo "ITEM_COUNT=0" >> $GITHUB_ENV
             echo "VIDEO_ID=${VIDEO_ID}" >> $GITHUB_ENV
+            echo "DURATION=0" >> $GITHUB_ENV
+            echo "THUMBNAIL_URL=${THUMBNAIL_URL}" >> $GITHUB_ENV
+            echo "VIEW_COUNT=${VIEW_COUNT}" >> $GITHUB_ENV
             echo "MEDIA_TYPE=${MEDIA_TYPE}" >> $GITHUB_ENV
+            echo "POST_TEXT=${POST_TEXT}" >> $GITHUB_ENV
             continue
           fi
           
@@ -404,7 +397,8 @@ jobs:
               --arg text "$(echo "$POST_TEXT" | cut -c1-500)" \
               --arg media_type "$MEDIA_TYPE" \
               --arg thumbnail "$THUMBNAIL_URL" \
-              '{path: $path, page: $page, title: $title, text: $text, media_type: $media_type, thumbnail: $thumbnail, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
+              --argjson views "${VIEW_COUNT:-0}" \
+              '{path: $path, page: $page, title: $title, text: $text, media_type: $media_type, thumbnail: $thumbnail, views: $views, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
             jq --arg id "$VIDEO_ID" --argjson entry "$CACHE_ENTRY" '. + {($id): $entry}' "$CACHE_INDEX" > /tmp/cache_tmp.json
             mv /tmp/cache_tmp.json "$CACHE_INDEX"
             echo "  💾 Cached: $VIDEO_ID"
@@ -417,9 +411,7 @@ jobs:
             echo "  📋 Saved media info: ${SAFE_NAME}_info.json"
           done
           
-          # ═══════════════════════════════════════════
           # README for page
-          # ═══════════════════════════════════════════
           ITEM_LIST=$(ls "${PAGE_DIR}"/*.mp4 "${PAGE_DIR}"/*.jpg "${PAGE_DIR}"/*.png 2>/dev/null | grep -v '_info\|_post\|page_info' | while read f; do
             bn=$(basename "$f"); echo "  📘 ${bn}"
           done)
@@ -442,6 +434,7 @@ jobs:
           echo "THUMBNAIL_URL=${THUMBNAIL_URL}" >> $GITHUB_ENV
           echo "VIEW_COUNT=${VIEW_COUNT}" >> $GITHUB_ENV
           echo "MEDIA_TYPE=${MEDIA_TYPE}" >> $GITHUB_ENV
+          echo "POST_TEXT=${POST_TEXT}" >> $GITHUB_ENV
           echo "✅ Done: ${ITEM_COUNT} item(s) from this URL"
           
           done
@@ -455,15 +448,16 @@ jobs:
           PAGE_NAME: ${{ env.PAGE_NAME }}
           TRACK_TITLE: ${{ env.TRACK_TITLE }}
           REPO_DIR: ${{ env.REPO_DIR }}
+          BRANCH: ${{ env.BRANCH }}
         run: |
           cd "$REPO_DIR"
           git add facebook/
           if git diff --staged --quiet; then
             echo "✅ No changes"
           else
-            git commit -m "feat(facebook): add $PAGE_NAME — $TRACK_TITLE"
-            git pull --rebase origin main || true
-            git push origin main
+            git commit -m "feat(facebook): add ${PAGE_NAME} — ${TRACK_TITLE}"
+            git pull --rebase origin ${BRANCH} || true
+            git push origin ${BRANCH}
             echo "✅ Pushed"
           fi
 
@@ -475,9 +469,9 @@ jobs:
           docker rm warp 2>/dev/null || true
 
       # ═══════════════════════════════════════════════════
-      # Step 10: Send Media Info to User
+      # Step 10: Send Combined Message (Media Info + Channel Link + Back Button)
       # ═══════════════════════════════════════════════════
-      - name: "🖼️ Send Media Info to User"
+      - name: "📬 Send Complete Result to User"
         if: github.event.inputs.chat_id != ''
         env:
           BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
@@ -485,35 +479,59 @@ jobs:
           FB_URLS: ${{ env.FB_URLS }}
           PAGE_NAME: ${{ env.PAGE_NAME }}
           TRACK_TITLE: ${{ env.TRACK_TITLE }}
+          DURATION: ${{ env.DURATION }}
           VIEW_COUNT: ${{ env.VIEW_COUNT }}
           THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
           MEDIA_TYPE: ${{ env.MEDIA_TYPE }}
+          POST_TEXT: ${{ env.POST_TEXT }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
           CACHE_HIT: ${{ env.CACHE_HIT }}
           CACHED_PAGE: ${{ env.CACHED_PAGE }}
           CACHED_TITLE: ${{ env.CACHED_TITLE }}
           CACHED_THUMB: ${{ env.CACHED_THUMB }}
+          CACHED_TEXT: ${{ env.CACHED_TEXT }}
+          CACHED_MEDIA_TYPE: ${{ env.CACHED_MEDIA_TYPE }}
+          CACHED_VIEWS: ${{ env.CACHED_VIEWS }}
+          ITEM_COUNT: ${{ env.ITEM_COUNT }}
         run: |
           #!/bin/bash
+          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          
+          # ── Determine which data to use (cache vs fresh) ──
           if [ "$CACHE_HIT" = "true" ]; then
-            PAGE_NAME_VAL="$CACHED_PAGE"
-            TITLE_NAME="$CACHED_TITLE"
-            THUMB_URL="$CACHED_THUMB"
-            VIEW_VAL="0"
-            MEDIA_TYPE_VAL="video"
+            PAGE_NAME_VAL="${CACHED_PAGE:-Unknown}"
+            TITLE_NAME="${CACHED_TITLE:-Untitled}"
+            THUMB_URL="${CACHED_THUMB:-}"
+            DURATION_VAL="0"
+            VIEW_VAL="${CACHED_VIEWS:-0}"
+            MEDIA_TYPE_VAL="${CACHED_MEDIA_TYPE:-video}"
+            POST_TEXT_VAL="${CACHED_TEXT:-}"
+            ITEM_COUNT_VAL="1"
+            SPEED_TEXT="⚡ از حافظه کش ارسال شد | "
           else
-            PAGE_NAME_VAL="$PAGE_NAME"
-            TITLE_NAME="$TRACK_TITLE"
-            THUMB_URL="$THUMBNAIL_URL"
-            VIEW_VAL="$VIEW_COUNT"
-            MEDIA_TYPE_VAL="$MEDIA_TYPE"
+            PAGE_NAME_VAL="${PAGE_NAME:-Unknown}"
+            TITLE_NAME="${TRACK_TITLE:-Untitled}"
+            THUMB_URL="${THUMBNAIL_URL:-}"
+            DURATION_VAL="${DURATION:-0}"
+            VIEW_VAL="${VIEW_COUNT:-0}"
+            MEDIA_TYPE_VAL="${MEDIA_TYPE:-video}"
+            POST_TEXT_VAL="${POST_TEXT:-}"
+            ITEM_COUNT_VAL="${ITEM_COUNT:-0}"
+            SPEED_TEXT=""
           fi
           
-          if [ "$MEDIA_TYPE_VAL" = "text" ]; then
-            echo "✅ Text-only post already sent — skipping"
-            exit 0
+          # ── Format duration ──
+          if [ "$DURATION_VAL" -gt 0 ] 2>/dev/null; then
+            DUR_MIN=$(( DURATION_VAL / 60 ))
+            DUR_REM=$(( DURATION_VAL % 60 ))
+            DUR_FMT="${DUR_MIN}:$(printf '%02d' $DUR_REM)"
+          else
+            DUR_FMT="—"
           fi
           
-          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
+          # ── Format views ──
+          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" != "null" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
             if [ "$VIEW_VAL" -gt 1000000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000000" | bc)M"
             elif [ "$VIEW_VAL" -gt 1000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000" | bc)K"
             else VIEWS_FMT="$VIEW_VAL"; fi
@@ -521,29 +539,104 @@ jobs:
             VIEWS_FMT="—"
           fi
           
-          CAPTION="📘 *${TITLE_NAME}*
-
+          # ── Build channel link ──
+          if [ -n "$CHANNEL_USERNAME" ]; then
+            CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
+          elif [ -n "$CHANNEL_ID" ]; then
+            CHANNEL_LINK="https://ble.ir/im/p/${CHANNEL_ID}"
+          else
+            CHANNEL_LINK="https://ble.ir"
+          fi
+          
+          # ── Truncate post text for preview ──
+          TEXT_PREVIEW=""
+          if [ -n "$POST_TEXT_VAL" ] && [ "$POST_TEXT_VAL" != "null" ]; then
+            if [ ${#POST_TEXT_VAL} -gt 300 ]; then
+              TEXT_PREVIEW="${POST_TEXT_VAL:0:300}..."
+            else
+              TEXT_PREVIEW="$POST_TEXT_VAL"
+            fi
+          fi
+          
+          # ── Build caption based on media type ──
+          if [ "$MEDIA_TYPE_VAL" = "text" ]; then
+            CAPTION="📘 *${TITLE_NAME}*
+          
           📄 *صفحه:* ${PAGE_NAME_VAL}
           👁 *بازدید:* ${VIEWS_FMT}
-
+          
+          📝 *متن پست:*
+          ${TEXT_PREVIEW}
+          
           🔗 [مشاهده در Facebook](${FB_URLS})"
+          else
+            CAPTION="📘 *${TITLE_NAME}*
           
+          📄 *صفحه:* ${PAGE_NAME_VAL}
+          ⏱ *مدت:* ${DUR_FMT}  |  👁 *بازدید:* ${VIEWS_FMT}
+          
+          ✅ *دانلود کامل شد!* ${SPEED_TEXT}📘 *تعداد:* ${ITEM_COUNT_VAL}
+          📁 فایل در کانال آرشیو شما ذخیره شد.
+          
+          🔗 [مشاهده در Facebook](${FB_URLS})"
+          fi
+          
+          # ── Build keyboard with channel link + back button ──
+          KEYBOARD=$(jq -n \
+            --arg channel_url "$CHANNEL_LINK" \
+            '{
+              inline_keyboard: [
+                [{text: "📂 دریافت فایل از کانال آرشیو", url: $channel_url}],
+                [{text: "🔙 بازگشت به منوی اصلی", callback_data: "back_to_main"}]
+              ]
+            }')
+          
+          # Escape for JSON
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -R -s '.')
+          ESCAPED_KEYBOARD=$(echo "$KEYBOARD" | jq -c '.')
+          
+          # ── Send as photo with caption (if thumbnail exists and not text-only) ──
           PHOTO_SENT=false
-          if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg photo "$THUMB_URL" --arg caption "$CAPTION" \
-              '{chat_id: $chat_id, photo: $photo, caption: $caption, parse_mode: "Markdown"}' > /tmp/photo_payload.json
-            PHOTO_RESPONSE=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendPhoto" \
-              -H "Content-Type: application/json" -d @/tmp/photo_payload.json)
-            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then PHOTO_SENT=true; fi
+          if [ "$MEDIA_TYPE_VAL" != "text" ] && [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
+            echo "🖼️ Sending photo with caption via JSON..."
+            PHOTO_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendPhoto" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"photo\": \"${THUMB_URL}\",
+                \"caption\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              PHOTO_SENT=true
+              echo "  ✅ Photo sent successfully"
+            else
+              echo "  ⚠️ Photo failed, trying text fallback..."
+            fi
           fi
           
+          # ── Fallback: send as text message via JSON ──
           if [ "$PHOTO_SENT" = false ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg text "$CAPTION" \
-              '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' > /tmp/text_payload.json
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" -d @/tmp/text_payload.json > /dev/null 2>&1
+            echo "📝 Sending as text message via JSON..."
+            TEXT_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"text\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$TEXT_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              echo "  ✅ Text sent successfully"
+            else
+              echo "  ❌ Text also failed: $TEXT_RESPONSE"
+            fi
           fi
-          echo "✅ Media info sent"
+          
+          echo "✅ Complete result sent to user"
 
       # ═══════════════════════════════════════════════════
       # Step 11: Upload Media to Channel
@@ -554,6 +647,7 @@ jobs:
           BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
           CHANNEL_ID: ${{ github.event.inputs.channel_id }}
           BACKUP_DIR: ${{ env.BACKUP_DIR }}
+          MEDIA_TYPE: ${{ env.MEDIA_TYPE }}
           CACHE_HIT: ${{ env.CACHE_HIT }}
           CACHED_FILE: ${{ env.CACHED_FILE }}
           REPO_DIR: ${{ env.REPO_DIR }}
@@ -564,10 +658,14 @@ jobs:
           
           if [ "$CACHE_HIT" = "true" ]; then
             FILE_PATH="${REPO_DIR}/${CACHED_FILE}"
+            if [ ! -f "$FILE_PATH" ]; then
+              echo "  ⚠️ Cached file not found — skipping"
+              exit 0
+            fi
             FILENAME=$(basename "$FILE_PATH")
             echo "  📄 Uploading from cache: $FILENAME"
             curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-              -F "video=@${FILE_PATH}" -F "caption=📘 ${FILENAME%.*} | Facebook" > /dev/null 2>&1
+              -F "video=@${FILE_PATH}" -F "caption=" > /dev/null 2>&1
             echo "    ✅ Uploaded"
           else
             for PAGE_FOLDER in "$BACKUP_DIR"/*/ ; do
@@ -578,65 +676,10 @@ jobs:
                 FILENAME=$(basename "$FILE")
                 echo "  📄 Uploading: $FILENAME"
                 curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-                  -F "video=@${FILE}" -F "caption=📘 ${PAGE_NAME_VAL} — ${FILENAME%.*} | Facebook" > /dev/null 2>&1
+                  -F "video=@${FILE}" -F "caption=" > /dev/null 2>&1
                 echo "    ✅ Uploaded"
                 sleep 3
               done
             done
           fi
           echo "✅ All media files uploaded"
-
-      # ═══════════════════════════════════════════════════
-      # Step 12: Notify User
-      # ═══════════════════════════════════════════════════
-      - name: "📬 Notify User"
-        if: github.event.inputs.chat_id != ''
-        env:
-          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
-          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
-          PAGE_NAME: ${{ env.PAGE_NAME }}
-          CACHED_PAGE: ${{ env.CACHED_PAGE }}
-          ITEM_COUNT: ${{ env.ITEM_COUNT }}
-          CACHE_HIT: ${{ env.CACHE_HIT }}
-        run: |
-          #!/bin/bash
-          if [ "$CACHE_HIT" = "true" ]; then
-            DISPLAY_PAGE="$CACHED_PAGE"
-            SPEED_TEXT="⚡ *از حافظه کش ارسال شد!*"
-            ITEM_COUNT_VAL="1"
-          else
-            DISPLAY_PAGE="$PAGE_NAME"
-            SPEED_TEXT=""
-            ITEM_COUNT_VAL="${ITEM_COUNT:-0}"
-          fi
-          
-          if [ -n "$CHANNEL_USERNAME" ]; then
-            CHANNEL_LINK="https://ble.ir/$CHANNEL_USERNAME"
-          elif [ -n "$CHANNEL_ID" ]; then
-            CHANNEL_LINK="https://ble.ir/im/p/$CHANNEL_ID"
-          else
-            CHANNEL_LINK=""
-          fi
-          
-          if [ -n "$CHANNEL_LINK" ]; then
-            KEYBOARD=$(jq -n --arg url "$CHANNEL_LINK" \
-              '{inline_keyboard: [[{text: "📂 مشاهده و دریافت فایل", url: $url}]]}')
-          else
-            KEYBOARD='{"inline_keyboard": []}'
-          fi
-          
-          if [ "$ITEM_COUNT_VAL" -eq 0 ]; then
-            ITEM_TEXT="📝 *پست متنی ارسال شد*"
-          else
-            ITEM_TEXT="📘 *تعداد ویدیو:* ${ITEM_COUNT_VAL}"
-          fi
-          
-          TEXT=$'✅ *دانلود از Facebook کامل شد!*\n\n📄 *صفحه:* '"${DISPLAY_PAGE}"$'\n'"${ITEM_TEXT}"$'\n'"${SPEED_TEXT}"$'\n\n📁 فایل در کانال آرشیو شما ذخیره شد.\n\n👇 برای دریافت روی دکمه زیر کلیک کنید:'
-          
-          jq -n --arg chat_id "$CHAT_ID" --arg text "$TEXT" --argjson reply_markup "$KEYBOARD" \
-            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", reply_markup: $reply_markup}' > /tmp/notify.json
-          curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" -d @/tmp/notify.json > /dev/null 2>&1
-          echo "✅ Notification sent"
