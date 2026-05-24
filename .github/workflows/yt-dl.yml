@@ -514,9 +514,9 @@ jobs:
           docker rm warp 2>/dev/null || true
 
       # ═══════════════════════════════════════════════════
-      # Step 9: Send Video Info to User
+      # Step 9: Send Combined Message (Video Info + Channel Link + Back Button)
       # ═══════════════════════════════════════════════════
-      - name: "🖼️ Send Video Info to User"
+      - name: "📬 Send Complete Result to User"
         if: github.event.inputs.chat_id != ''
         env:
           BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
@@ -528,28 +528,39 @@ jobs:
           VIEW_COUNT: ${{ env.VIEW_COUNT }}
           THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
           QUALITY: ${{ env.QUALITY }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
           CACHE_HIT: ${{ env.CACHE_HIT }}
           CACHED_CREATOR: ${{ env.CACHED_CREATOR }}
           CACHED_TITLE: ${{ env.CACHED_TITLE }}
           CACHED_THUMB: ${{ env.CACHED_THUMB }}
           CACHED_DURATION: ${{ env.CACHED_DURATION }}
           CACHED_VIEWS: ${{ env.CACHED_VIEWS }}
+          VIDEO_COUNT: ${{ env.VIDEO_COUNT }}
         run: |
           #!/bin/bash
+          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          
+          # ── Determine which data to use (cache vs fresh) ──
           if [ "$CACHE_HIT" = "true" ]; then
-            CREATOR_NAME="$CACHED_CREATOR"
-            TITLE_NAME="$CACHED_TITLE"
-            THUMB_URL="$CACHED_THUMB"
-            DURATION_VAL="$CACHED_DURATION"
-            VIEW_VAL="$CACHED_VIEWS"
+            CREATOR_NAME="${CACHED_CREATOR:-Unknown}"
+            TITLE_NAME="${CACHED_TITLE:-Untitled}"
+            THUMB_URL="${CACHED_THUMB:-}"
+            DURATION_VAL="${CACHED_DURATION:-0}"
+            VIEW_VAL="${CACHED_VIEWS:-0}"
+            VIDEO_COUNT_VAL="1"
+            SPEED_TEXT="⚡ از حافظه کش ارسال شد | "
           else
-            CREATOR_NAME="$CREATOR"
-            TITLE_NAME="$TRACK_TITLE"
-            THUMB_URL="$THUMBNAIL_URL"
-            DURATION_VAL="$DURATION"
-            VIEW_VAL="$VIEW_COUNT"
+            CREATOR_NAME="${CREATOR:-Unknown}"
+            TITLE_NAME="${TRACK_TITLE:-Untitled}"
+            THUMB_URL="${THUMBNAIL_URL:-}"
+            DURATION_VAL="${DURATION:-0}"
+            VIEW_VAL="${VIEW_COUNT:-0}"
+            VIDEO_COUNT_VAL="${VIDEO_COUNT:-1}"
+            SPEED_TEXT=""
           fi
           
+          # ── Format duration ──
           if [ "$DURATION_VAL" -gt 0 ] 2>/dev/null; then
             DUR_MIN=$(( DURATION_VAL / 60 ))
             DUR_REM=$(( DURATION_VAL % 60 ))
@@ -558,7 +569,8 @@ jobs:
             DUR_FMT="—"
           fi
           
-          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
+          # ── Format views ──
+          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" != "null" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
             if [ "$VIEW_VAL" -gt 1000000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000000" | bc)M"
             elif [ "$VIEW_VAL" -gt 1000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000" | bc)K"
             else VIEWS_FMT="$VIEW_VAL"; fi
@@ -566,31 +578,83 @@ jobs:
             VIEWS_FMT="—"
           fi
           
+          # ── Build channel link ──
+          if [ -n "$CHANNEL_USERNAME" ]; then
+            CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
+          elif [ -n "$CHANNEL_ID" ]; then
+            CHANNEL_LINK="https://ble.ir/im/p/${CHANNEL_ID}"
+          else
+            CHANNEL_LINK="https://ble.ir"
+          fi
+          
+          # ── Build caption (combined: video info + completion notice) ──
           CAPTION="🎬 *${TITLE_NAME}*
-
+          
           👤 *سازنده:* ${CREATOR_NAME}
-          ⏱ *مدت:* ${DUR_FMT}
-          👁 *بازدید:* ${VIEWS_FMT}
-
+          ⏱ *مدت:* ${DUR_FMT}  |  👁 *بازدید:* ${VIEWS_FMT}
+          
+          ✅ *دانلود کامل شد!* ${SPEED_TEXT}🎬 *تعداد:* ${VIDEO_COUNT_VAL}
+          📁 فایل در کانال آرشیو شما ذخیره شد.
+          
           🔗 [مشاهده در YouTube](${YT_URLS})"
           
+          # ── Build keyboard with channel link + back button ──
+          KEYBOARD=$(jq -n \
+            --arg channel_url "$CHANNEL_LINK" \
+            '{
+              inline_keyboard: [
+                [{text: "📂 دریافت فایل از کانال آرشیو", url: $channel_url}],
+                [{text: "🔙 بازگشت به منوی اصلی", callback_data: "back_to_main"}]
+              ]
+            }')
+          
+          # Escape for JSON
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -R -s '.')
+          ESCAPED_KEYBOARD=$(echo "$KEYBOARD" | jq -c '.')
+          
+          # ── Send as photo with caption (if thumbnail exists) ──
           PHOTO_SENT=false
           if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg photo "$THUMB_URL" --arg caption "$CAPTION" \
-              '{chat_id: $chat_id, photo: $photo, caption: $caption, parse_mode: "Markdown"}' > /tmp/photo_payload.json
-            PHOTO_RESPONSE=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendPhoto" \
-              -H "Content-Type: application/json" -d @/tmp/photo_payload.json)
-            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then PHOTO_SENT=true; fi
+            echo "🖼️ Sending photo with caption via JSON..."
+            PHOTO_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendPhoto" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"photo\": \"${THUMB_URL}\",
+                \"caption\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              PHOTO_SENT=true
+              echo "  ✅ Photo sent successfully"
+            else
+              echo "  ⚠️ Photo failed, trying text fallback..."
+            fi
           fi
           
+          # ── Fallback: send as text message via JSON ──
           if [ "$PHOTO_SENT" = false ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg text "$CAPTION" \
-              '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' > /tmp/text_payload.json
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" -d @/tmp/text_payload.json > /dev/null 2>&1
+            echo "📝 Sending as text message via JSON..."
+            TEXT_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"text\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$TEXT_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              echo "  ✅ Text sent successfully"
+            else
+              echo "  ❌ Text also failed: $TEXT_RESPONSE"
+            fi
           fi
-          echo "✅ Video info sent"
-
+          
+          echo "✅ Complete result sent to user"
+          
       # ═══════════════════════════════════════════════════
       # Step 10: Upload Video to Channel
       # ═══════════════════════════════════════════════════
@@ -643,52 +707,3 @@ jobs:
             done
           fi
           echo "✅ All videos uploaded"
-
-      # ═══════════════════════════════════════════════════
-      # Step 11: Notify User with Channel Link
-      # ═══════════════════════════════════════════════════
-      - name: "📬 Notify User"
-        if: github.event.inputs.chat_id != ''
-        env:
-          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
-          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
-          CREATOR: ${{ env.CREATOR }}
-          CACHED_CREATOR: ${{ env.CACHED_CREATOR }}
-          VIDEO_COUNT: ${{ env.VIDEO_COUNT }}
-          CACHE_HIT: ${{ env.CACHE_HIT }}
-        run: |
-          #!/bin/bash
-          if [ "$CACHE_HIT" = "true" ]; then
-            DISPLAY_CREATOR="$CACHED_CREATOR"
-            SPEED_TEXT="⚡ *از حافظه کش ارسال شد!*"
-            VIDEO_COUNT_VAL="1"
-          else
-            DISPLAY_CREATOR="$CREATOR"
-            SPEED_TEXT=""
-            VIDEO_COUNT_VAL="${VIDEO_COUNT:-1}"
-          fi
-          
-          if [ -n "$CHANNEL_USERNAME" ]; then
-            CHANNEL_LINK="https://ble.ir/$CHANNEL_USERNAME"
-          elif [ -n "$CHANNEL_ID" ]; then
-            CHANNEL_LINK="https://ble.ir/im/p/$CHANNEL_ID"
-          else
-            CHANNEL_LINK=""
-          fi
-          
-          if [ -n "$CHANNEL_LINK" ]; then
-            KEYBOARD=$(jq -n --arg url "$CHANNEL_LINK" \
-              '{inline_keyboard: [[{text: "📂 مشاهده و دریافت فایل", url: $url}]]}')
-          else
-            KEYBOARD='{"inline_keyboard": []}'
-          fi
-          
-          TEXT=$'✅ *دانلود از YouTube کامل شد!*\n\n👤 *سازنده:* '"${DISPLAY_CREATOR}"$'\n🎬 *تعداد ویدیو:* '"${VIDEO_COUNT_VAL}"$'\n'"${SPEED_TEXT}"$'\n\n📁 فایل در کانال آرشیو شما ذخیره شد.\n\n👇 برای دریافت روی دکمه زیر کلیک کنید:'
-          
-          jq -n --arg chat_id "$CHAT_ID" --arg text "$TEXT" --argjson reply_markup "$KEYBOARD" \
-            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", reply_markup: $reply_markup}' > /tmp/notify.json
-          curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" -d @/tmp/notify.json > /dev/null 2>&1
-          echo "✅ Notification sent"
