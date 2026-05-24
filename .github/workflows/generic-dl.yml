@@ -1,23 +1,24 @@
 # ============================================================
-# generic-dl.yml — Bale Generic Downloader V1
+# generic-dl.yml — Bale Generic Downloader V2
 # Repository: github.com/khashayardev/DownloadHub
 # ============================================================
-# Features V1:
+# Features V2:
 #   ۱. Supports 1800+ sites via yt-dlp (any URL auto-detected)
 #   ۲. Auto URL normalization (short links → full URLs)
 #   ۳. Auto platform detection from URL patterns
 #   ۴. 8 bypass methods + Deno JS solver (for YouTube)
 #   ۵. Cache system — instant skip if already downloaded
-#   ۶. Quality-aware FFmpeg Segment (direct split, 0% quality loss)
-#   ۷. Each segment guaranteed < 45MB for Bale
-#   ۸. WARP + Dependencies run in parallel (faster startup)
+#   ۶. Quality mapping: 720→best, 480→medium
+#   ۷. Quality-aware FFmpeg Segment (direct split, 0% quality loss)
+#   ۸. Each segment guaranteed < 45MB for Bale
 #   ۹. Speed-optimized: concurrent-fragments 16, buffer 32K
-#   ۱۰. Git push with --force-with-lease (no rebase overhead)
-#   ۱۱. Persian captions + thumbnail notifications
+#   ۱۰. Git push with --force-with-lease
+#   ۱۱. Combined single message (thumbnail + caption + channel link + back button)
 #   ۱۲. Auto folder: downloads/{platform}/{creator-slug}/
+#   ۱۳. Compatible with Bale DownloadHub Bot v3
 # ============================================================
 
-name: "🌐 Generic Downloader V1"
+name: "🌐 Generic Downloader V2"
 
 on:
   workflow_dispatch:
@@ -27,15 +28,13 @@ on:
         required: true
         type: string
       quality:
-        description: "📊 Quality"
+        description: "📊 Quality (720=best, 480=medium, audio=MP3)"
         required: false
         type: choice
-        default: "best"
+        default: "720"
         options:
-          - best
-          - 1080
-          - 720
-          - 480
+          - "720"
+          - "480"
           - audio
       chat_id:
         description: "🆔 User Chat ID"
@@ -69,18 +68,14 @@ jobs:
       actions: read
 
     steps:
-      # ═══════════════════════════════════════════════════
-      # Step 1: Checkout
-      # ═══════════════════════════════════════════════════
+      # ── Step 1: Checkout ──────────────────────────────
       - name: "📥 Checkout Repository"
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
-      # ═══════════════════════════════════════════════════
-      # Step 2: Git Config
-      # ═══════════════════════════════════════════════════
+      # ── Step 2: Git Config ────────────────────────────
       - name: "⚙️ Configure Git"
         run: |
           git config --global http.postBuffer 524288000
@@ -92,9 +87,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # ═══════════════════════════════════════════════════
-      # Step 3: WARP (Background) + Dependencies (Parallel)
-      # ═══════════════════════════════════════════════════
+      # ── Step 3: WARP (Background) + Dependencies ──────
       - name: "🌐 Start WARP (Background)"
         run: |
           docker network create warp-net 2>/dev/null || true
@@ -105,36 +98,30 @@ jobs:
             --sysctl net.ipv4.conf.all.src_valid_mark=1 \
             -v warp-data:/var/lib/cloudflare-warp \
             caomingjun/warp:latest
-          echo "✅ WARP container started (warming up)"
+          echo "✅ WARP container started"
 
       - name: "📦 Install Dependencies + Wait WARP"
         run: |
-          echo "⏳ Installing packages while WARP warms up..."
           sudo apt-get update -qq 2>&1 | tail -1
           sudo apt-get install -y -qq python3-pip ffmpeg curl jq bc 2>&1 | tail -1
           pip3 install --upgrade yt-dlp --quiet 2>&1 | tail -1
           
-          echo "📦 Installing Deno JS Runtime..."
           curl -fsSL https://deno.land/install.sh | sh 2>&1 | tail -2
           export DENO_INSTALL="$HOME/.deno"
           export PATH="$DENO_INSTALL/bin:$PATH"
           echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
           
-          echo "⏳ Waiting for WARP..."
           for i in $(seq 1 12); do
             RESULT=$(curl -s --max-time 3 --socks5-hostname 127.0.0.1:1080 \
               https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
             if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
-              echo "✅ WARP ready after ${i}s"
-              break
+              echo "✅ WARP ready after ${i}s"; break
             fi
             sleep 1
           done
           echo "✅ All dependencies ready"
 
-      # ═══════════════════════════════════════════════════
-      # Step 4: URL Normalization & Platform Detection
-      # ═══════════════════════════════════════════════════
+      # ── Step 4: URL Normalization & Platform Detection ──
       - name: "🔗 Normalize URL & Detect Platform"
         id: detect
         env:
@@ -147,42 +134,28 @@ jobs:
           echo "  🔗 Input URL: ${URL}"
           echo "════════════════════════════════════════"
           
-          # ── URL Normalization Patterns ──────────────────
           # YouTube Shorts → Standard
           if [[ "$URL" =~ youtube\.com/shorts/([a-zA-Z0-9_-]{11}) ]]; then
             VIDEO_ID="${BASH_REMATCH[1]%%\?*}"
             URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
             echo "🔄 Normalized: YouTube Shorts → Standard"
-          
           # youtu.be → youtube.com
           elif [[ "$URL" =~ youtu\.be/([a-zA-Z0-9_-]{11}) ]]; then
             VIDEO_ID="${BASH_REMATCH[1]%%\?*}"
             URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
             echo "🔄 Normalized: youtu.be → youtube.com"
-          
           # YouTube Music → Standard
           elif [[ "$URL" =~ music\.youtube\.com/watch ]]; then
             URL="${URL/music.youtube.com/www.youtube.com}"
             echo "🔄 Normalized: YouTube Music → Standard"
-          
           # Instagram /reel/ → /p/
           elif [[ "$URL" =~ instagram\.com/reel/ ]]; then
             URL="${URL/\/reel\//\/p\/}"
             echo "🔄 Normalized: Instagram Reel → Post"
-          
-          # TikTok vm.tiktok.com short links
-          elif [[ "$URL" =~ vm\.tiktok\.com ]]; then
-            echo "ℹ️ TikTok short link detected (will follow redirect)"
-          
-          # Twitter/X.com → fix if needed
+          # Twitter/X.com → fix
           elif [[ "$URL" =~ x\.com/ ]]; then
             URL="${URL/x.com/twitter.com}"
             echo "🔄 Normalized: x.com → twitter.com"
-          
-          # Facebook /share/ → /watch/
-          elif [[ "$URL" =~ facebook\.com/share/ ]]; then
-            echo "ℹ️ Facebook share link detected"
-          
           # Remove tracking parameters
           elif [[ "$URL" =~ \? ]]; then
             BASE_URL="${URL%%\?*}"
@@ -208,9 +181,8 @@ jobs:
           echo "📎 Normalized URL: ${URL}"
           echo "NORMALIZED_URL=${URL}" >> $GITHUB_ENV
           
-          # ── Platform Detection ──────────────────────────
+          # Platform Detection
           PLATFORM="generic"
-          
           if [[ "$URL" =~ youtube\.com|youtu\.be|music\.youtube\.com|youtube-nocookie\.com ]]; then
             PLATFORM="youtube"
           elif [[ "$URL" =~ soundcloud\.com|on\.soundcloud\.com ]]; then
@@ -239,8 +211,6 @@ jobs:
             PLATFORM="rumble"
           elif [[ "$URL" =~ odysee\.com ]]; then
             PLATFORM="odysee"
-          elif [[ "$URL" =~ dailymotion\.com ]]; then
-            PLATFORM="dailymotion"
           elif [[ "$URL" =~ ok\.ru ]]; then
             PLATFORM="okru"
           elif [[ "$URL" =~ vk\.com|vk\.ru ]]; then
@@ -261,20 +231,21 @@ jobs:
           echo "PLATFORM=${PLATFORM}" >> $GITHUB_ENV
           echo "✅ URL normalized & platform detected"
 
-      # ═══════════════════════════════════════════════════
-      # Step 5: Setup Download Parameters
-      # ═══════════════════════════════════════════════════
+      # ── Step 5: Setup Parameters ──────────────────────
       - name: "🔧 Setup Parameters"
         id: setup
         env:
           QUALITY: ${{ github.event.inputs.quality }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           QUALITY="${QUALITY}"
           PLATFORM="${{ env.PLATFORM }}"
+          BRANCH="${BRANCH}"
           
-          echo "🎬 Quality: ${QUALITY} | Platform: ${PLATFORM}"
+          echo "🎬 Quality: ${QUALITY} | Platform: ${PLATFORM} | Branch: ${BRANCH}"
           
           echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
+          echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
           echo "REPO_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
           echo "BACKUP_DIR=/tmp/dl_$$" >> $GITHUB_ENV
           echo "CACHE_INDEX=${GITHUB_WORKSPACE}/downloads/cache_index.json" >> $GITHUB_ENV
@@ -286,32 +257,25 @@ jobs:
             echo '{}' > "${GITHUB_WORKSPACE}/downloads/cache_index.json"
           fi
           
-          # ── Quality-based Format Selection ─────────────
+          # Quality mapping: 720 → best, 480 → medium, audio → audio
           case "${QUALITY}" in
             audio) FORMAT="bestaudio/bestaudio*/best" ;;
-            best)  FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
-            1080)  FORMAT="bestvideo[height<=1080]+bestaudio/bestvideo[height<=1080]*+bestaudio*/bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
-            720)   FORMAT="bestvideo[height<=720]+bestaudio/bestvideo[height<=720]*+bestaudio*/bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
+            720)   FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
             480)   FORMAT="bestvideo[height<=480]+bestaudio/bestvideo[height<=480]*+bestaudio*/bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
             *)     FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
           esac
           echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
           
-          # ── Quality Bitrate Caps ────────────────────────
           case "${QUALITY}" in
-            1080) QUALITY_MAX_BITRATE=4000 ;;
-            720)  QUALITY_MAX_BITRATE=2500 ;;
-            480)  QUALITY_MAX_BITRATE=1500 ;;
-            audio) QUALITY_MAX_BITRATE=320  ;;
+            720) QUALITY_MAX_BITRATE=3000 ;;
+            480) QUALITY_MAX_BITRATE=1500 ;;
+            audio) QUALITY_MAX_BITRATE=320 ;;
             *)    QUALITY_MAX_BITRATE=3000 ;;
           esac
           echo "QUALITY_MAX_BITRATE=${QUALITY_MAX_BITRATE}" >> $GITHUB_ENV
-          
           echo "✅ Parameters configured"
 
-      # ═══════════════════════════════════════════════════
-      # Step 6: Cache Check
-      # ═══════════════════════════════════════════════════
+      # ── Step 6: Cache Check ────────────────────────────
       - name: "🔍 Cache Check"
         id: cache_check
         run: |
@@ -320,9 +284,7 @@ jobs:
           CACHE_INDEX="${{ env.CACHE_INDEX }}"
           REPO_DIR="${{ env.REPO_DIR }}"
           
-          # Generate cache key from URL (hash)
           CACHE_KEY=$(echo "$URL" | md5sum | cut -d' ' -f1 | head -c 12)
-          
           echo "🔑 Cache key: ${CACHE_KEY}"
           
           CACHED_PATH=$(jq -r ".\"${CACHE_KEY}\".path // empty" "$CACHE_INDEX" 2>/dev/null || echo "")
@@ -335,6 +297,8 @@ jobs:
             echo "CACHED_TITLE=$(jq -r ".\"${CACHE_KEY}\".title // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
             echo "CACHED_THUMB=$(jq -r ".\"${CACHE_KEY}\".thumbnail // \"\"" "$CACHE_INDEX")" >> $GITHUB_ENV
             echo "CACHED_SEGMENTS=$(jq -r ".\"${CACHE_KEY}\".segments // 1" "$CACHE_INDEX")" >> $GITHUB_ENV
+            echo "CACHED_VIEWS=$(jq -r ".\"${CACHE_KEY}\".views // 0" "$CACHE_INDEX")" >> $GITHUB_ENV
+            echo "CACHED_EXTRACTOR=$(jq -r ".\"${CACHE_KEY}\".extractor // \"generic\"" "$CACHE_INDEX")" >> $GITHUB_ENV
           else
             echo "🆕 Not in cache"
             echo "CACHE_HIT=false" >> $GITHUB_ENV
@@ -342,9 +306,7 @@ jobs:
           
           echo "CACHE_KEY=${CACHE_KEY}" >> $GITHUB_ENV
 
-      # ═══════════════════════════════════════════════════
-      # Step 7: Download & Process
-      # ═══════════════════════════════════════════════════
+      # ── Step 7: Download & Process ────────────────────
       - name: "🌐 Download & Process"
         id: download
         if: env.CACHE_HIT != 'true'
@@ -363,13 +325,10 @@ jobs:
           shopt -s nullglob
           set -e
           
-          # ── Constants ─────────────────────────────────
           TARGET_SIZE_MB=45
           TARGET_SIZE_BYTES=$(( TARGET_SIZE_MB * 1024 * 1024 ))
-          AUDIO_BITRATE_KBPS=128
           MAX_FILE_SIZE=$(( 2048 * 1024 * 1024 ))
           
-          # ── Helpers ────────────────────────────────────
           sanitize_name() {
             local name="$1"
             name=$(echo "$name" | sed 's/[()（）]/_/g' | sed 's/[][{}\/\\<>|:;'"'"'"]/_/g')
@@ -386,7 +345,6 @@ jobs:
             else echo "$num"; fi
           }
           
-          # ── Download Function (8 methods) ──────────────
           download_media() {
             local METHOD=$1 URL=$2 TMP_DIR=$3
             echo "  🔄 Method $METHOD..."
@@ -399,33 +357,24 @@ jobs:
             
             case $METHOD in
               1) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS \
-                   --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36" \
-                   "$URL" ;;
+                   --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36" "$URL" ;;
               2) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS \
-                   --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github \
-                   "$URL" ;;
+                   --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" ;;
               3) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS \
-                   --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github \
-                   "$URL" ;;
+                   --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$URL" ;;
               4) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS \
                    --extractor-args "youtube:player_client=mweb" "$URL" ;;
               5) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS \
                    --extractor-args "youtube:player_client=android_vr" "$URL" ;;
               6) yt-dlp --format "$FORMAT" $COMMON_FLAGS \
-                   --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github \
-                   "$URL" ;;
-              7) yt-dlp --format "$FORMAT" $COMMON_FLAGS \
-                   "$URL" ;;
+                   --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" ;;
+              7) yt-dlp --format "$FORMAT" $COMMON_FLAGS "$URL" ;;
               8) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS \
-                   --user-agent "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/112.0.0.0 Mobile Safari/537.36" \
-                   "$URL" ;;
+                   --user-agent "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/112.0.0.0 Mobile Safari/537.36" "$URL" ;;
               *) return 1 ;;
             esac
           }
           
-          # ═══════════════════════════════════════════════
-          # Main Processing
-          # ═══════════════════════════════════════════════
           URL="${{ env.URL }}"
           echo "🔍 Fetching metadata: $URL"
           
@@ -448,13 +397,11 @@ jobs:
           CREATOR_DIR="${REPO_DIR}/downloads/${CREATOR_SLUG}"
           mkdir -p "$CREATOR_DIR"
           
-          # ── Creator Info ─────────────────────────────
           printf '{\n  "creator": "%s",\n  "extractor": "%s",\n  "url": "%s",\n  "views": %s,\n  "likes": %s,\n  "last_updated": "%s"\n}\n' \
             "$CREATOR" "$EXTRACTOR" "$WEBPAGE_URL" "${VIEW_COUNT:-0}" "${LIKE_COUNT:-0}" \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             > "${CREATOR_DIR}/creator_info.json"
           
-          # ── Download ─────────────────────────────────
           TMP_DIR="tmp_dl_$$"
           mkdir -p "$TMP_DIR"
           echo "⬇️ Downloading: $TITLE"
@@ -463,11 +410,9 @@ jobs:
           for METHOD in 1 2 3 4 5 6 7 8; do
             if download_media $METHOD "$URL" "$TMP_DIR"; then
               echo "  ✅ Downloaded (method $METHOD)"
-              DOWNLOAD_SUCCESS=true
-              break
+              DOWNLOAD_SUCCESS=true; break
             else
-              echo "  ❌ Method $METHOD failed"
-              sleep 1
+              echo "  ❌ Method $METHOD failed"; sleep 1
             fi
           done
           
@@ -478,9 +423,6 @@ jobs:
             exit 0
           fi
           
-          # ═══════════════════════════════════════════════
-          # Quality-Aware FFmpeg Segment
-          # ═══════════════════════════════════════════════
           VIDEO_COUNT=0
           TOTAL_SEGMENTS=0
           
@@ -496,50 +438,36 @@ jobs:
             [ "$FILE_SIZE" -gt "$MAX_FILE_SIZE" ] && echo "  ⚠️ >2GB — skip" && continue
             
             if [ "$FILE_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
-              echo ""
-              echo "  ╔══════════════════════════════════════╗"
-              echo "  ║  📦 $(( FILE_SIZE / 1024 / 1024 ))MB — SEGMENTING  ║"
-              echo "  ╚══════════════════════════════════════╝"
+              echo "  📦 $(( FILE_SIZE / 1024 / 1024 ))MB — SEGMENTING"
               
-              # Analyze
               VIDEO_BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$MEDIA_FILE" 2>/dev/null || echo "0")
               DURATION_SEC=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$MEDIA_FILE" 2>/dev/null || echo "0")
-              VIDEO_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$MEDIA_FILE" 2>/dev/null || echo "0")
               
               [ -z "$VIDEO_BITRATE" ] || [ "$VIDEO_BITRATE" = "0" ] || [ "$VIDEO_BITRATE" = "N/A" ] && \
                 VIDEO_BITRATE=$(echo "scale=0; ($FILE_SIZE * 8) / ($DURATION_SEC * 1000)" | bc 2>/dev/null || echo "2000")
               
               VIDEO_BITRATE_KBPS=$(( VIDEO_BITRATE / 1000 ))
-              echo "  📊 ${VIDEO_BITRATE_KBPS}kbps, ${VIDEO_HEIGHT}p, ${DURATION_SEC}s"
-              
-              # Calculate segment duration for 45MB
               TARGET_BITS=$(( TARGET_SIZE_MB * 8 * 1024 * 1024 * 90 / 100 ))
               SEGMENT_DURATION=$(echo "scale=0; $TARGET_BITS / (${VIDEO_BITRATE_KBPS} * 1000)" | bc 2>/dev/null || echo "120")
               [ "$SEGMENT_DURATION" -lt 30 ] && SEGMENT_DURATION=30
               [ "$SEGMENT_DURATION" -gt 600 ] && SEGMENT_DURATION=600
               
-              echo "  ⏱ Segment: ${SEGMENT_DURATION}s | 🎯 Direct Split (0% loss)"
-              
               SEGMENT_DIR="${BACKUP_DIR}/${CREATOR_SLUG}/segments"
               mkdir -p "$SEGMENT_DIR"
               
-              # Direct split — no re-encode
               ffmpeg -i "$MEDIA_FILE" -c copy -map 0 \
                 -segment_time "$SEGMENT_DURATION" -f segment \
                 -reset_timestamps 1 -segment_start_number 1 \
                 "${SEGMENT_DIR}/${SAFE_NAME}_part%03d.${EXT}" \
                 -y -loglevel error 2>&1
               
-              # Verify & fix oversized
               SEGMENT_COUNT=0
               for SEG_FILE in "${SEGMENT_DIR}/${SAFE_NAME}_part"*.${EXT}; do
                 [ -f "$SEG_FILE" ] || continue
                 SEG_SIZE=$(stat -c%s "$SEG_FILE" 2>/dev/null || echo 0)
-                SEG_SIZE_MB=$(( SEG_SIZE / 1024 / 1024 ))
                 SEGMENT_COUNT=$((SEGMENT_COUNT + 1))
                 
                 if [ "$SEG_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
-                  echo "    ⚠️ ${SEG_SIZE_MB}MB — fixing..."
                   REDUCED=$(( TARGET_SIZE_MB * 8 * 1000 * 85 / 100 / (DURATION_SEC / SEGMENT_COUNT) ))
                   [ "$REDUCED" -lt 200 ] && REDUCED=200
                   ffmpeg -i "$SEG_FILE" -c:v libx264 -b:v "${REDUCED}k" \
@@ -547,14 +475,9 @@ jobs:
                     -preset fast -c:a aac -b:a 128k \
                     "${SEG_FILE}.fixed.${EXT}" -y -loglevel error 2>&1
                   [ -f "${SEG_FILE}.fixed.${EXT}" ] && mv "${SEG_FILE}.fixed.${EXT}" "$SEG_FILE"
-                  echo "      ✅ Fixed"
-                else
-                  echo "    ✅ ${SEG_SIZE_MB}MB OK"
                 fi
               done
-              echo "  📊 ${SEGMENT_COUNT} segments"
               
-              # Copy to repo
               for SEG_FILE in "${SEGMENT_DIR}/${SAFE_NAME}_part"*.${EXT}; do
                 [ -f "$SEG_FILE" ] || continue
                 SEG_BASENAME=$(basename "$SEG_FILE")
@@ -562,7 +485,6 @@ jobs:
                 VIDEO_COUNT=$((VIDEO_COUNT + 1))
               done
               TOTAL_SEGMENTS=$SEGMENT_COUNT
-              
             else
               echo "  📦 $(( FILE_SIZE / 1024 / 1024 ))MB — direct save"
               cp "$MEDIA_FILE" "${CREATOR_DIR}/${SAFE_NAME}.${EXT}"
@@ -572,31 +494,29 @@ jobs:
               TOTAL_SEGMENTS=1
             fi
             
-            # Thumbnail
             THUMB_FILE=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
             if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
               cp "$THUMB_FILE" "${CREATOR_DIR}/${SAFE_NAME}.jpg" 2>/dev/null
             fi
             
-            # Cache
             CACHE_ENTRY=$(jq -n \
               --arg path "downloads/${CREATOR_SLUG}/${SAFE_NAME}.${EXT}" \
               --arg creator "$CREATOR" --arg title "$TITLE" \
-              --arg thumbnail "$THUMBNAIL_URL" --argjson segments "$TOTAL_SEGMENTS" \
-              '{path: $path, creator: $creator, title: $title, thumbnail: $thumbnail, segments: $segments, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
+              --arg extractor "$EXTRACTOR" \
+              --arg thumbnail "$THUMBNAIL_URL" \
+              --argjson segments "$TOTAL_SEGMENTS" \
+              --argjson views "${VIEW_COUNT:-0}" \
+              '{path: $path, creator: $creator, title: $title, extractor: $extractor, thumbnail: $thumbnail, segments: $segments, views: $views, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
             jq --arg id "$CACHE_KEY" --argjson entry "$CACHE_ENTRY" \
               '. + {($id): $entry}' "$CACHE_INDEX" > /tmp/cache_tmp.json
             mv /tmp/cache_tmp.json "$CACHE_INDEX"
             
-            # Info JSON
             printf '{\n  "title": "%s",\n  "creator": "%s",\n  "extractor": "%s",\n  "duration": %s,\n  "views": %s,\n  "thumbnail": "%s",\n  "url": "%s",\n  "segments": %s\n}\n' \
               "$TITLE" "$CREATOR" "$EXTRACTOR" "${DURATION:-0}" "${VIEW_COUNT:-0}" \
               "$THUMBNAIL_URL" "$WEBPAGE_URL" "$TOTAL_SEGMENTS" \
               > "${CREATOR_DIR}/${SAFE_NAME}_info.json"
-            
           done
           
-          # README
           FILE_LIST=$(ls "${CREATOR_DIR}"/*.mp4 "${CREATOR_DIR}"/*.webm "${CREATOR_DIR}"/*.mkv "${CREATOR_DIR}"/*.mp3 2>/dev/null | while read f; do
             bn=$(basename "$f"); echo "  📁 ${bn}"
           done)
@@ -620,11 +540,11 @@ jobs:
           echo "DOWNLOAD_SUCCESS=true" >> $GITHUB_ENV
           echo "✅ Done: ${VIDEO_COUNT} file(s), ${TOTAL_SEGMENTS} segment(s)"
 
-      # ═══════════════════════════════════════════════════
-      # Step 8: Commit & Push
-      # ═══════════════════════════════════════════════════
+      # ── Step 8: Commit & Push ─────────────────────────
       - name: "📤 Commit & Push"
         if: env.CACHE_HIT != 'true' && env.DOWNLOAD_SUCCESS == 'true'
+        env:
+          BRANCH: ${{ env.BRANCH }}
         run: |
           cd "$REPO_DIR"
           git add downloads/
@@ -632,13 +552,12 @@ jobs:
             echo "✅ No changes"
           else
             git commit -m "feat: add ${{ env.CREATOR }} — ${{ env.TITLE }} [${{ env.EXTRACTOR }}]" --quiet
-            git push origin main --force-with-lease 2>&1
+            git pull --rebase origin ${BRANCH} || true
+            git push origin ${BRANCH} --force-with-lease 2>&1
             echo "✅ Pushed"
           fi
 
-      # ═══════════════════════════════════════════════════
-      # Step 9: Stop WARP
-      # ═══════════════════════════════════════════════════
+      # ── Step 9: Stop WARP ─────────────────────────────
       - name: "🛑 Stop WARP"
         if: always()
         run: |
@@ -646,59 +565,147 @@ jobs:
           docker rm warp 2>/dev/null || true
 
       # ═══════════════════════════════════════════════════
-      # Step 10: Send Info to User
+      # Step 10: Send Combined Message (Info + Channel Link + Back Button)
       # ═══════════════════════════════════════════════════
-      - name: "🖼️ Send Info to User"
+      - name: "📬 Send Complete Result to User"
         if: github.event.inputs.chat_id != '' && env.DOWNLOAD_SUCCESS == 'true'
         env:
           BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CREATOR: ${{ env.CREATOR }}
+          TITLE: ${{ env.TITLE }}
+          EXTRACTOR: ${{ env.EXTRACTOR }}
+          THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
+          TOTAL_SEGMENTS: ${{ env.TOTAL_SEGMENTS }}
+          VIEW_COUNT: ${{ env.VIEW_COUNT }}
+          DURATION: ${{ env.DURATION }}
+          NORMALIZED_URL: ${{ env.NORMALIZED_URL }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
+          CACHE_HIT: ${{ env.CACHE_HIT }}
+          CACHED_CREATOR: ${{ env.CACHED_CREATOR }}
+          CACHED_TITLE: ${{ env.CACHED_TITLE }}
+          CACHED_THUMB: ${{ env.CACHED_THUMB }}
+          CACHED_SEGMENTS: ${{ env.CACHED_SEGMENTS }}
+          CACHED_VIEWS: ${{ env.CACHED_VIEWS }}
+          CACHED_EXTRACTOR: ${{ env.CACHED_EXTRACTOR }}
+          VIDEO_COUNT: ${{ env.VIDEO_COUNT }}
         run: |
           #!/bin/bash
-          CREATOR_NAME="${{ env.CREATOR }}"
-          TITLE_NAME="${{ env.TITLE }}"
-          EXTRACTOR_NAME="${{ env.EXTRACTOR }}"
-          THUMB_URL="${{ env.THUMBNAIL_URL }}"
-          SEG_COUNT="${TOTAL_SEGMENTS:-1}"
-          VIEW_VAL="${{ env.VIEW_COUNT }}"
-          DURATION_VAL="${{ env.DURATION }}"
-          URL="${{ env.NORMALIZED_URL }}"
+          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
           
-          [ "$DURATION_VAL" -gt 0 ] 2>/dev/null && \
-            DUR_FMT="$(( DURATION_VAL / 60 )):$(printf '%02d' $(( DURATION_VAL % 60 )))" || DUR_FMT="—"
+          if [ "$CACHE_HIT" = "true" ]; then
+            CREATOR_NAME="${CACHED_CREATOR:-Unknown}"
+            TITLE_NAME="${CACHED_TITLE:-Untitled}"
+            THUMB_URL="${CACHED_THUMB:-}"
+            EXTRACTOR_NAME="${CACHED_EXTRACTOR:-generic}"
+            DURATION_VAL="0"
+            VIEW_VAL="${CACHED_VIEWS:-0}"
+            SEG_COUNT="${CACHED_SEGMENTS:-1}"
+            VIDEO_COUNT_VAL="1"
+            SPEED_TEXT="⚡ از حافظه کش ارسال شد | "
+          else
+            CREATOR_NAME="${CREATOR:-Unknown}"
+            TITLE_NAME="${TITLE:-Untitled}"
+            THUMB_URL="${THUMBNAIL_URL:-}"
+            EXTRACTOR_NAME="${EXTRACTOR:-generic}"
+            DURATION_VAL="${DURATION:-0}"
+            VIEW_VAL="${VIEW_COUNT:-0}"
+            SEG_COUNT="${TOTAL_SEGMENTS:-1}"
+            VIDEO_COUNT_VAL="${VIDEO_COUNT:-1}"
+            SPEED_TEXT=""
+          fi
           
-          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
-            [ "$VIEW_VAL" -gt 1000000 ] && VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000000" | bc)M" || \
-            [ "$VIEW_VAL" -gt 1000 ] && VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000" | bc)K" || VIEWS_FMT="$VIEW_VAL"
+          if [ "$DURATION_VAL" -gt 0 ] 2>/dev/null; then
+            DUR_MIN=$(( DURATION_VAL / 60 ))
+            DUR_REM=$(( DURATION_VAL % 60 ))
+            DUR_FMT="${DUR_MIN}:$(printf '%02d' $DUR_REM)"
+          else
+            DUR_FMT="—"
+          fi
+          
+          if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" != "null" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
+            if [ "$VIEW_VAL" -gt 1000000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000000" | bc)M"
+            elif [ "$VIEW_VAL" -gt 1000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000" | bc)K"
+            else VIEWS_FMT="$VIEW_VAL"; fi
           else
             VIEWS_FMT="—"
+          fi
+          
+          if [ -n "$CHANNEL_USERNAME" ]; then
+            CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
+          elif [ -n "$CHANNEL_ID" ]; then
+            CHANNEL_LINK="https://ble.ir/im/p/${CHANNEL_ID}"
+          else
+            CHANNEL_LINK="https://ble.ir"
           fi
           
           [ "$SEG_COUNT" -gt 1 ] && SEGMENT_INFO="📦 *تعداد قسمت:* ${SEG_COUNT} (همه قابل پخش)" || SEGMENT_INFO=""
           
           CAPTION="🎬 *${TITLE_NAME}*
+          
           👤 *سازنده:* ${CREATOR_NAME}
           🏷 *منبع:* ${EXTRACTOR_NAME}
-          ⏱ *مدت:* ${DUR_FMT}
-          👁 *بازدید:* ${VIEWS_FMT}
+          ⏱ *مدت:* ${DUR_FMT}  |  👁 *بازدید:* ${VIEWS_FMT}
           ${SEGMENT_INFO}
-          🔗 [لینک منبع](${URL})"
+          
+          ✅ *دانلود کامل شد!* ${SPEED_TEXT}📁 *فایل:* ${VIDEO_COUNT_VAL} عدد
+          📁 فایل در کانال آرشیو شما ذخیره شد.
+          
+          🔗 [لینک منبع](${NORMALIZED_URL})"
+          
+          KEYBOARD=$(jq -n \
+            --arg channel_url "$CHANNEL_LINK" \
+            '{
+              inline_keyboard: [
+                [{text: "📂 دریافت فایل از کانال آرشیو", url: $channel_url}],
+                [{text: "🔙 بازگشت به منوی اصلی", callback_data: "back_to_main"}]
+              ]
+            }')
+          
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -R -s '.')
+          ESCAPED_KEYBOARD=$(echo "$KEYBOARD" | jq -c '.')
           
           PHOTO_SENT=false
           if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg photo "$THUMB_URL" --arg caption "$CAPTION" \
-              '{chat_id: $chat_id, photo: $photo, caption: $caption, parse_mode: "Markdown"}' > /tmp/photo.json
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendPhoto" \
-              -H "Content-Type: application/json" -d @/tmp/photo.json | jq -e '.ok' > /dev/null 2>&1 && PHOTO_SENT=true
+            echo "🖼️ Sending photo with caption via JSON..."
+            PHOTO_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendPhoto" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"photo\": \"${THUMB_URL}\",
+                \"caption\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              PHOTO_SENT=true
+              echo "  ✅ Photo sent successfully"
+            else
+              echo "  ⚠️ Photo failed, trying text fallback..."
+            fi
           fi
           
           if [ "$PHOTO_SENT" = false ]; then
-            jq -n --arg chat_id "$CHAT_ID" --arg text "$CAPTION" \
-              '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' > /tmp/text.json
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" -d @/tmp/text.json > /dev/null 2>&1
+            echo "📝 Sending as text message via JSON..."
+            TEXT_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"text\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$TEXT_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              echo "  ✅ Text sent successfully"
+            else
+              echo "  ❌ Text also failed: $TEXT_RESPONSE"
+            fi
           fi
-          echo "✅ Info sent"
+          
+          echo "✅ Complete result sent to user"
 
       # ═══════════════════════════════════════════════════
       # Step 11: Upload to Channel
@@ -719,54 +726,21 @@ jobs:
             [ -d "$CREATOR_FOLDER" ] || continue
             CREATOR_NAME=$(basename "$CREATOR_FOLDER")
             
-            for FILE in "$CREATOR_FOLDER"/segments/* "$CREATOR_FOLDER"/* "$CREATOR_FOLDER"/segments/*_sub*.mp4; do
+            for FILE in "$CREATOR_FOLDER"/segments/* "$CREATOR_FOLDER"/*; do
               [ -f "$FILE" ] || continue
               [[ "$FILE" == *.jpg ]] && continue
               FILENAME=$(basename "$FILE")
               
-              if [[ "$FILENAME" =~ _part([0-9]+) ]]; then
-                CAPTION="📁 ${CREATOR_NAME} — ${FILENAME%.*} | Part ${BASH_REMATCH[1]}"
-              else
-                CAPTION="📁 ${CREATOR_NAME} — ${FILENAME%.*}"
-              fi
-              
               echo "  📄 $FILENAME"
               if [[ "$FILENAME" == *.mp3 ]] || [[ "$QUALITY" == "audio" ]]; then
                 curl -s -X POST "${API}/sendAudio" -F "chat_id=${CHANNEL_ID}" \
-                  -F "audio=@${FILE}" -F "caption=${CAPTION}" > /dev/null 2>&1
+                  -F "audio=@${FILE}" -F "caption=" > /dev/null 2>&1
               else
                 curl -s -X POST "${API}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-                  -F "video=@${FILE}" -F "caption=${CAPTION}" > /dev/null 2>&1
+                  -F "video=@${FILE}" -F "caption=" > /dev/null 2>&1
               fi
               echo "    ✅"
               sleep 3
             done
           done
           echo "✅ Uploads done"
-
-      # ═══════════════════════════════════════════════════
-      # Step 12: Notify User
-      # ═══════════════════════════════════════════════════
-      - name: "📬 Notify User"
-        if: github.event.inputs.chat_id != '' && env.DOWNLOAD_SUCCESS == 'true'
-        env:
-          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
-          CHANNEL_ID_INPUT: ${{ github.event.inputs.channel_id }}
-        run: |
-          #!/bin/bash
-          [ -n "$CHANNEL_USERNAME" ] && CHANNEL_LINK="https://ble.ir/$CHANNEL_USERNAME" || \
-          [ -n "$CHANNEL_ID_INPUT" ] && CHANNEL_LINK="https://ble.ir/im/p/$CHANNEL_ID_INPUT" || CHANNEL_LINK=""
-          
-          [ -n "$CHANNEL_LINK" ] && \
-            KEYBOARD='{"inline_keyboard":[[{"text":"📂 مشاهده و دریافت فایل","url":"'"$CHANNEL_LINK"'"}]]}' || \
-            KEYBOARD='{"inline_keyboard":[]}'
-          
-          TEXT=$'✅ *دانلود کامل شد!*\n\n👤 *سازنده:* ${{ env.CREATOR }}\n📁 *فایل:* ${{ env.VIDEO_COUNT }} عدد\n📦 *قسمت:* ${{ env.TOTAL_SEGMENTS }} عدد\n\n📁 فایل در کانال آرشیو شما ذخیره شد.\n👇 برای دریافت روی دکمه زیر کلیک کنید:'
-          
-          jq -n --arg chat_id "$CHAT_ID" --arg text "$TEXT" --argjson reply_markup "$KEYBOARD" \
-            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", reply_markup: $reply_markup}' > /tmp/notify.json
-          curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" -d @/tmp/notify.json > /dev/null 2>&1
-          echo "✅ Notification sent"
