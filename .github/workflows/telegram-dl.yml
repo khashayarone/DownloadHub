@@ -1,0 +1,729 @@
+# ============================================================
+# telegram-dl.yml — Bale Telegram Downloader V1
+# Repository: github.com/khashayardev/DownloadHub
+# ============================================================
+# Features V1:
+#   ۱. Download videos, audio, documents from public Telegram channels
+#   ۲. Download text posts from public Telegram channels
+#   ۳. Auto-organize by channel name (folder = channel slug)
+#   ۴. Cache system — instant skip if already downloaded
+#   ۵. Quality mapping: 720→best, 480→medium
+#   ۶. Configurable media type: video, audio, document, text, all
+#   ۷. Configurable max items (last N posts)
+#   ۸. 45MB segment limit for Bale compatibility
+#   ۹. Metadata embedding + thumbnail artwork
+#   ۱۰. Rich channel info in channel_info.json
+#   ۱۱. Auto-generated README.md per channel with stats
+#   ۱۲. Combined single message (thumbnail + caption + channel link + back button)
+#   ۱۳. Video via sendVideo, audio via sendAudio, doc via sendDocument
+#   ۱۴. Text posts sent via sendMessage to archive channel
+#   ۱۵. 2 download methods (WARP proxy + direct fallback)
+#   ۱۶. Compatible with Bale DownloadHub Bot v3
+# ============================================================
+
+name: "📨 Telegram Downloader"
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_urls:
+        description: "🔗 Telegram public channel link or post link (t.me/...)"
+        required: true
+        type: string
+      quality:
+        description: "📹 Video Quality (720=best, 480=medium)"
+        required: false
+        type: choice
+        default: "720"
+        options:
+          - "720"
+          - "480"
+      media_type:
+        description: "📋 Media Type to Download"
+        required: false
+        type: choice
+        default: "all"
+        options:
+          - all
+          - video
+          - audio
+          - document
+          - text
+      max_items:
+        description: "🔢 Max Items to Download (last N posts)"
+        required: false
+        type: string
+        default: "10"
+      chat_id:
+        description: "🆔 User Chat ID for notification"
+        required: false
+        type: string
+        default: ""
+      channel_id:
+        description: "📢 Channel ID for archiving"
+        required: false
+        type: string
+        default: ""
+      channel_username:
+        description: "📢 Channel Username"
+        required: false
+        type: string
+        default: ""
+
+env:
+  PROJECT_NAME: "Khashayar Downloader"
+  PROJECT_URL: "https://khashayar.one"
+  PLATFORM: "telegram"
+  TARGET_SIZE_MB: 45
+  TARGET_SIZE_BYTES: 47185920
+
+jobs:
+  download:
+    name: "📨 Download & Store"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      # ── Step 1: Checkout ──────────────────────────────
+      - name: "📥 Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # ── Step 2: Git Config ────────────────────────────
+      - name: "⚙️ Configure Git"
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # ── Step 3: Cloudflare WARP ───────────────────────
+      - name: "🌐 Setup Cloudflare WARP"
+        run: |
+          docker network create warp-net 2>/dev/null || true
+          docker run -d \
+            --name warp --restart=no --network warp-net \
+            -p 1080:1080 --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp:latest
+          sleep 15
+          for i in $(seq 1 5); do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then echo "✅ WARP active!"; break; else sleep 5; fi
+          done
+
+      # ── Step 4: Dependencies ───────────────────────────
+      - name: "📦 Install Dependencies"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip ffmpeg zip curl jq bc unzip
+          pip3 install --upgrade yt-dlp --quiet
+
+      # ── Step 5: Setup Parameters ──────────────────────
+      - name: "🔧 Setup Download Parameters"
+        id: setup
+        env:
+          TG_URLS: ${{ github.event.inputs.telegram_urls }}
+          TG_QUALITY: ${{ github.event.inputs.quality }}
+          TG_MEDIA_TYPE: ${{ github.event.inputs.media_type }}
+          TG_MAX: ${{ github.event.inputs.max_items }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          TG_URLS="${TG_URLS}"
+          QUALITY="${TG_QUALITY}"
+          MEDIA_TYPE="${TG_MEDIA_TYPE}"
+          MAX_ITEMS="${TG_MAX}"
+          BRANCH="${BRANCH}"
+          
+          echo "════════════════════════════════════════"
+          echo "  $PROJECT_NAME | $PROJECT_URL"
+          echo "════════════════════════════════════════"
+          echo "📨 URL: ${TG_URLS}"
+          echo "📹 Quality: ${QUALITY} | Media Type: ${MEDIA_TYPE}"
+          echo "🔢 Max Items: ${MAX_ITEMS}"
+          echo "🌿 Branch: ${BRANCH}"
+          
+          echo "TG_URLS=${TG_URLS}" >> $GITHUB_ENV
+          echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
+          echo "MEDIA_TYPE=${MEDIA_TYPE}" >> $GITHUB_ENV
+          echo "MAX_ITEMS=${MAX_ITEMS}" >> $GITHUB_ENV
+          echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
+          echo "REPO_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
+          echo "BACKUP_DIR=/tmp/tg_downloads_$$" >> $GITHUB_ENV
+          echo "CACHE_INDEX=${GITHUB_WORKSPACE}/telegram/cache_index.json" >> $GITHUB_ENV
+          
+          mkdir -p /tmp/tg_downloads_$$
+          mkdir -p "${GITHUB_WORKSPACE}/telegram"
+          
+          if [ ! -f "${GITHUB_WORKSPACE}/telegram/cache_index.json" ]; then
+            echo '{}' > "${GITHUB_WORKSPACE}/telegram/cache_index.json"
+          fi
+          
+          # Quality mapping: 720 → best, 480 → medium
+          case "${QUALITY}" in
+            720)   FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
+            480)   FORMAT="bestvideo[height<=480]+bestaudio/bestvideo[height<=480]*+bestaudio*/bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
+            *)     FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
+          esac
+          echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
+          
+          # Media type filter for yt-dlp
+          case "${MEDIA_TYPE}" in
+            video)    MATCH_FILTER="!is_live & (has_video | is_video)" ;;
+            audio)    MATCH_FILTER="!is_live & (has_audio | is_audio)" ;;
+            document) MATCH_FILTER="!is_live & (ext=zip | ext=rar | ext=pdf | ext=exe | ext=apk | ext=doc | ext=docx | ext=xls | ext=xlsx | ext=ppt | ext=pptx)" ;;
+            text)     MATCH_FILTER="!is_live & (ext=txt | ext=html | ext=json | ext=xml | ext=csv)" ;;
+            all)      MATCH_FILTER="!is_live" ;;
+            *)        MATCH_FILTER="!is_live" ;;
+          esac
+          echo "MATCH_FILTER=${MATCH_FILTER}" >> $GITHUB_ENV
+          
+          # Playlist flag for channel downloads
+          if [[ "$TG_URLS" =~ t\.me/[a-zA-Z0-9_]+$ ]] || [[ "$TG_URLS" =~ t\.me/[a-zA-Z0-9_]+/?$ ]]; then
+            PLAYLIST_FLAG="--yes-playlist --playlist-end ${MAX_ITEMS}"
+          else
+            PLAYLIST_FLAG="--no-playlist"
+          fi
+          echo "PLAYLIST_FLAG=${PLAYLIST_FLAG}" >> $GITHUB_ENV
+          
+          echo "✅ Setup complete"
+
+      # ═══════════════════════════════════════════════════
+      # Step 6: Cache Check
+      # ═══════════════════════════════════════════════════
+      - name: "🔍 Cache Check"
+        id: cache_check
+        run: |
+          #!/bin/bash
+          TG_URLS="${{ env.TG_URLS }}"
+          CACHE_INDEX="${{ env.CACHE_INDEX }}"
+          REPO_DIR="${{ env.REPO_DIR }}"
+          
+          # Extract post ID or channel name from URL
+          if [[ "$TG_URLS" =~ t\.me/[a-zA-Z0-9_]+/([0-9]+) ]]; then
+            CACHE_KEY="${BASH_REMATCH[1]}"
+          else
+            CACHE_KEY=$(echo "$TG_URLS" | md5sum | cut -d' ' -f1 | head -c 12)
+          fi
+          
+          echo "🔑 Cache key: ${CACHE_KEY}"
+          
+          CACHED_PATH=$(jq -r ".\"${CACHE_KEY}\".path // empty" "$CACHE_INDEX" 2>/dev/null || echo "")
+          
+          if [ -n "$CACHED_PATH" ] && [ -f "${REPO_DIR}/${CACHED_PATH}" ]; then
+            echo "✅ CACHE HIT: ${CACHED_PATH}"
+            echo "CACHE_HIT=true" >> $GITHUB_ENV
+            echo "CACHED_FILE=${CACHED_PATH}" >> $GITHUB_ENV
+            echo "CACHED_CHANNEL=$(jq -r ".\"${CACHE_KEY}\".channel // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+            echo "CACHED_TITLE=$(jq -r ".\"${CACHE_KEY}\".title // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+            echo "CACHED_THUMB=$(jq -r ".\"${CACHE_KEY}\".thumbnail // \"\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+            echo "CACHED_MEDIA_TYPE=$(jq -r ".\"${CACHE_KEY}\".media_type // \"unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
+            echo "CACHED_VIEWS=$(jq -r ".\"${CACHE_KEY}\".views // 0" "$CACHE_INDEX")" >> $GITHUB_ENV
+          else
+            echo "🆕 Not in cache"
+            echo "CACHE_HIT=false" >> $GITHUB_ENV
+          fi
+          
+          echo "CACHE_KEY=${CACHE_KEY}" >> $GITHUB_ENV
+
+      # ═══════════════════════════════════════════════════
+      # Step 7: Download & Process
+      # ═══════════════════════════════════════════════════
+      - name: "📨 Download & Process"
+        id: download
+        if: env.CACHE_HIT != 'true'
+        env:
+          BACKUP_DIR: ${{ env.BACKUP_DIR }}
+          FORMAT: ${{ env.FORMAT }}
+          QUALITY: ${{ env.QUALITY }}
+          MEDIA_TYPE: ${{ env.MEDIA_TYPE }}
+          MATCH_FILTER: ${{ env.MATCH_FILTER }}
+          PLAYLIST_FLAG: ${{ env.PLAYLIST_FLAG }}
+          TG_URLS: ${{ env.TG_URLS }}
+          REPO_DIR: ${{ env.REPO_DIR }}
+          CACHE_INDEX: ${{ env.CACHE_INDEX }}
+          CACHE_KEY: ${{ env.CACHE_KEY }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        run: |
+          #!/bin/bash
+          shopt -s nullglob
+          set -e
+          
+          TARGET_SIZE_MB=45
+          TARGET_SIZE_BYTES=$(( TARGET_SIZE_MB * 1024 * 1024 ))
+          MAX_FILE_SIZE=$(( 2048 * 1024 * 1024 ))
+          
+          sanitize_name() {
+            local name="$1"
+            name=$(echo "$name" | sed 's/[()（）]/_/g' | sed 's/[][{}\/\\<>|:;'"'"'"]/_/g')
+            name=$(echo "$name" | tr '[:space:]｜　' '-' | tr -c 'a-zA-Z0-9_-' '-' | tr -s '-' | sed 's/^-//;s/-$//')
+            [ -z "$name" ] && name="unknown"
+            echo "$name"
+          }
+          
+          format_number() {
+            local num=$1
+            if [ -z "$num" ] || [ "$num" = "null" ]; then echo "0"; return; fi
+            if [ "$num" -gt 1000000 ] 2>/dev/null; then echo "$(echo "scale=1; $num / 1000000" | bc)M"
+            elif [ "$num" -gt 1000 ] 2>/dev/null; then echo "$(echo "scale=1; $num / 1000" | bc)K"
+            else echo "$num"; fi
+          }
+          
+          truncate_text() {
+            local text="$1"
+            local max_len="${2:-300}"
+            if [ ${#text} -gt $max_len ]; then
+              echo "${text:0:$max_len}..."
+            else
+              echo "$text"
+            fi
+          }
+          
+          URL="${{ env.TG_URLS }}"
+          echo "🔍 Fetching metadata for: $URL"
+          
+          # Get channel info from first item
+          INFO_JSON=$(yt-dlp --proxy "socks5://127.0.0.1:1080" --dump-json --skip-download \
+            --playlist-end 1 "$URL" 2>/dev/null || echo "{}")
+          
+          CHANNEL_NAME=$(echo "$INFO_JSON" | jq -r '.channel // .uploader // "Unknown Channel"')
+          CHANNEL_ID=$(echo "$INFO_JSON" | jq -r '.channel_id // ""')
+          
+          echo "  📢 Channel: $CHANNEL_NAME"
+          
+          CHANNEL_SLUG=$(sanitize_name "$CHANNEL_NAME")
+          CHANNEL_DIR="${REPO_DIR}/telegram/${CHANNEL_SLUG}"
+          mkdir -p "$CHANNEL_DIR"
+          
+          TMP_DIR="tmp_tg_$$"
+          mkdir -p "$TMP_DIR"
+          
+          echo "⬇️ Downloading media from channel..."
+          
+          # Download with playlist support for channels
+          yt-dlp --proxy "socks5://127.0.0.1:1080" \
+            --format "$FORMAT" \
+            --match-filter "$MATCH_FILTER" \
+            $PLAYLIST_FLAG \
+            --merge-output-format mp4 \
+            --write-thumbnail --convert-thumbnails jpg \
+            --no-cache-dir \
+            --output "${TMP_DIR}/%(title)s.%(ext)s" \
+            --no-part \
+            --retries 5 --fragment-retries 5 --no-check-certificates \
+            --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M \
+            --progress --newline \
+            --embed-metadata \
+            "$URL" 2>&1 || {
+            echo "  🔄 Retry without proxy..."
+            yt-dlp --format "$FORMAT" \
+              --match-filter "$MATCH_FILTER" \
+              $PLAYLIST_FLAG \
+              --merge-output-format mp4 \
+              --write-thumbnail --convert-thumbnails jpg \
+              --no-cache-dir \
+              --output "${TMP_DIR}/%(title)s.%(ext)s" \
+              --no-part \
+              --retries 5 --fragment-retries 5 --no-check-certificates \
+              --concurrent-fragments 8 --progress --newline \
+              --embed-metadata \
+              "$URL" 2>&1
+          }
+          
+          ITEM_COUNT=0
+          TOTAL_SEGMENTS=0
+          MEDIA_TYPE_DETECTED="unknown"
+          POST_TEXT_COLLECTED=""
+          
+          # Process downloaded files
+          for MEDIA_FILE in "$TMP_DIR"/*; do
+            [ -f "$MEDIA_FILE" ] || continue
+            
+            BASENAME=$(basename "$MEDIA_FILE")
+            FILENAME_NO_EXT="${BASENAME%.*}"
+            SAFE_NAME=$(sanitize_name "$FILENAME_NO_EXT")
+            EXT="${BASENAME##*.}"
+            FILE_SIZE=$(stat -c%s "$MEDIA_FILE" 2>/dev/null || echo 0)
+            
+            [ "$FILE_SIZE" -gt "$MAX_FILE_SIZE" ] && echo "  ⚠️ >2GB — skip" && continue
+            
+            # Determine media type from extension
+            case "$EXT" in
+              mp4|webm|mkv|mov|avi)
+                DETECTED_TYPE="video" ;;
+              mp3|m4a|ogg|wav|flac|aac)
+                DETECTED_TYPE="audio" ;;
+              jpg|jpeg|png|gif|webp|bmp)
+                # Skip thumbnails
+                [[ "$BASENAME" == *.jpg ]] && continue
+                DETECTED_TYPE="photo" ;;
+              txt|html|json|xml|csv|md)
+                DETECTED_TYPE="text"
+                POST_TEXT_COLLECTED=$(cat "$MEDIA_FILE" 2>/dev/null || echo "")
+                ;;
+              zip|rar|pdf|exe|apk|doc|docx|xls|xlsx|ppt|pptx)
+                DETECTED_TYPE="document" ;;
+              *)
+                DETECTED_TYPE="document" ;;
+            esac
+            
+            MEDIA_TYPE_DETECTED="$DETECTED_TYPE"
+            
+            # For text files: save text, skip large files
+            if [ "$DETECTED_TYPE" = "text" ]; then
+              echo "  📝 Text file: $BASENAME"
+              cp "$MEDIA_FILE" "${CHANNEL_DIR}/${SAFE_NAME}.txt"
+              
+              printf '{\n  "title": "%s",\n  "channel": "%s",\n  "text": %s,\n  "media_type": "text",\n  "url": "%s"\n}\n' \
+                "$FILENAME_NO_EXT" "$CHANNEL_NAME" "$(cat "$MEDIA_FILE" | jq -Rsc '.')" "$URL" \
+                > "${CHANNEL_DIR}/${SAFE_NAME}_info.json"
+              
+              ITEM_COUNT=$((ITEM_COUNT + 1))
+              TOTAL_SEGMENTS=1
+              continue
+            fi
+            
+            # Skip thumbnails
+            if [ "$DETECTED_TYPE" = "photo" ]; then
+              continue
+            fi
+            
+            # Check if file needs segmenting
+            if [ "$FILE_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
+              echo "  📦 $(( FILE_SIZE / 1024 / 1024 ))MB — SEGMENTING"
+              
+              VIDEO_BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$MEDIA_FILE" 2>/dev/null || echo "0")
+              DURATION_SEC=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$MEDIA_FILE" 2>/dev/null || echo "0")
+              
+              [ -z "$VIDEO_BITRATE" ] || [ "$VIDEO_BITRATE" = "0" ] || [ "$VIDEO_BITRATE" = "N/A" ] && \
+                VIDEO_BITRATE=$(echo "scale=0; ($FILE_SIZE * 8) / ($DURATION_SEC * 1000)" | bc 2>/dev/null || echo "2000")
+              
+              VIDEO_BITRATE_KBPS=$(( VIDEO_BITRATE / 1000 ))
+              TARGET_BITS=$(( TARGET_SIZE_MB * 8 * 1024 * 1024 * 90 / 100 ))
+              SEGMENT_DURATION=$(echo "scale=0; $TARGET_BITS / (${VIDEO_BITRATE_KBPS} * 1000)" | bc 2>/dev/null || echo "120")
+              [ "$SEGMENT_DURATION" -lt 30 ] && SEGMENT_DURATION=30
+              [ "$SEGMENT_DURATION" -gt 600 ] && SEGMENT_DURATION=600
+              
+              SEGMENT_DIR="${BACKUP_DIR}/${CHANNEL_SLUG}/segments"
+              mkdir -p "$SEGMENT_DIR"
+              
+              ffmpeg -i "$MEDIA_FILE" -c copy -map 0 \
+                -segment_time "$SEGMENT_DURATION" -f segment \
+                -reset_timestamps 1 -segment_start_number 1 \
+                "${SEGMENT_DIR}/${SAFE_NAME}_part%03d.${EXT}" \
+                -y -loglevel error 2>&1
+              
+              SEGMENT_COUNT=0
+              for SEG_FILE in "${SEGMENT_DIR}/${SAFE_NAME}_part"*.${EXT}; do
+                [ -f "$SEG_FILE" ] || continue
+                SEG_SIZE=$(stat -c%s "$SEG_FILE" 2>/dev/null || echo 0)
+                SEGMENT_COUNT=$((SEGMENT_COUNT + 1))
+                
+                if [ "$SEG_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
+                  REDUCED=$(( TARGET_SIZE_MB * 8 * 1000 * 85 / 100 / (DURATION_SEC / SEGMENT_COUNT) ))
+                  [ "$REDUCED" -lt 200 ] && REDUCED=200
+                  ffmpeg -i "$SEG_FILE" -c:v libx264 -b:v "${REDUCED}k" \
+                    -maxrate "${REDUCED}k" -bufsize "$(( REDUCED * 2 ))k" \
+                    -preset fast -c:a aac -b:a 128k \
+                    "${SEG_FILE}.fixed.${EXT}" -y -loglevel error 2>&1
+                  [ -f "${SEG_FILE}.fixed.${EXT}" ] && mv "${SEG_FILE}.fixed.${EXT}" "$SEG_FILE"
+                fi
+              done
+              
+              for SEG_FILE in "${SEGMENT_DIR}/${SAFE_NAME}_part"*.${EXT}; do
+                [ -f "$SEG_FILE" ] || continue
+                SEG_BASENAME=$(basename "$SEG_FILE")
+                cp "$SEG_FILE" "${CHANNEL_DIR}/${SEG_BASENAME}"
+                ITEM_COUNT=$((ITEM_COUNT + 1))
+              done
+              TOTAL_SEGMENTS=$SEGMENT_COUNT
+            else
+              echo "  📦 $(( FILE_SIZE / 1024 / 1024 ))MB — direct save"
+              cp "$MEDIA_FILE" "${CHANNEL_DIR}/${SAFE_NAME}.${EXT}"
+              mkdir -p "${BACKUP_DIR}/${CHANNEL_SLUG}"
+              cp "$MEDIA_FILE" "${BACKUP_DIR}/${CHANNEL_SLUG}/${SAFE_NAME}.${EXT}"
+              ITEM_COUNT=$((ITEM_COUNT + 1))
+              TOTAL_SEGMENTS=1
+            fi
+            
+            # Get thumbnail if exists
+            THUMB_FILE=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | grep -i "$SAFE_NAME" | head -1)
+            [ -z "$THUMB_FILE" ] && THUMB_FILE=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
+            if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
+              cp "$THUMB_FILE" "${CHANNEL_DIR}/${SAFE_NAME}.jpg" 2>/dev/null
+            fi
+            
+            # Get metadata for this specific item
+            ITEM_INFO=$(yt-dlp --proxy "socks5://127.0.0.1:1080" --dump-json --skip-download \
+              "${URL}" 2>/dev/null || echo "{}")
+            ITEM_TITLE=$(echo "$ITEM_INFO" | jq -r '.title // "Untitled"')
+            ITEM_VIEWS=$(echo "$ITEM_INFO" | jq -r '.view_count // 0')
+            ITEM_THUMBNAIL=$(echo "$ITEM_INFO" | jq -r '.thumbnail // ""')
+            
+            # Cache entry
+            CACHE_ENTRY=$(jq -n \
+              --arg path "telegram/${CHANNEL_SLUG}/${SAFE_NAME}.${EXT}" \
+              --arg channel "$CHANNEL_NAME" --arg title "$ITEM_TITLE" \
+              --arg media_type "$DETECTED_TYPE" \
+              --arg thumbnail "$ITEM_THUMBNAIL" \
+              --argjson segments "$TOTAL_SEGMENTS" \
+              --argjson views "${ITEM_VIEWS:-0}" \
+              '{path: $path, channel: $channel, title: $title, media_type: $media_type, thumbnail: $thumbnail, segments: $segments, views: $views, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
+            jq --arg id "${CACHE_KEY}_${ITEM_COUNT}" --argjson entry "$CACHE_ENTRY" \
+              '. + {($id): $entry}' "$CACHE_INDEX" > /tmp/cache_tmp.json
+            mv /tmp/cache_tmp.json "$CACHE_INDEX"
+            
+            # Info JSON
+            printf '{\n  "title": "%s",\n  "channel": "%s",\n  "media_type": "%s",\n  "file_size": %s,\n  "views": %s,\n  "thumbnail": "%s",\n  "url": "%s",\n  "segments": %s\n}\n' \
+              "$ITEM_TITLE" "$CHANNEL_NAME" "$DETECTED_TYPE" \
+              "${FILE_SIZE:-0}" "${ITEM_VIEWS:-0}" "$ITEM_THUMBNAIL" \
+              "$URL" "$TOTAL_SEGMENTS" \
+              > "${CHANNEL_DIR}/${SAFE_NAME}_info.json"
+            
+          done
+          
+          # Generate README
+          FILE_LIST=$(ls "${CHANNEL_DIR}"/*.mp4 "${CHANNEL_DIR}"/*.mp3 "${CHANNEL_DIR}"/*.zip "${CHANNEL_DIR}"/*.rar "${CHANNEL_DIR}"/*.pdf 2>/dev/null | while read f; do
+            bn=$(basename "$f"); echo "  📁 ${bn}"
+          done)
+          
+          printf '# %s\n\n**Telegram Channel:** %s\n**URL:** %s\n\n## Files (%s items)\n\n%s\n\n*Downloaded via [khashayar.one](https://khashayar.one)*\n' \
+            "$CHANNEL_NAME" "$CHANNEL_NAME" "$URL" \
+            "${ITEM_COUNT}" "$(echo "$FILE_LIST" | sed 's/^/  /')" \
+            > "${CHANNEL_DIR}/README.md"
+          
+          rm -rf "$TMP_DIR"
+          
+          echo "CHANNEL_NAME=${CHANNEL_NAME}" >> $GITHUB_ENV
+          echo "CHANNEL_SLUG=${CHANNEL_SLUG}" >> $GITHUB_ENV
+          echo "ITEM_COUNT=${ITEM_COUNT}" >> $GITHUB_ENV
+          echo "TOTAL_SEGMENTS=${TOTAL_SEGMENTS}" >> $GITHUB_ENV
+          echo "MEDIA_TYPE_DETECTED=${MEDIA_TYPE_DETECTED}" >> $GITHUB_ENV
+          echo "THUMBNAIL_URL=${ITEM_THUMBNAIL}" >> $GITHUB_ENV
+          echo "DOWNLOAD_SUCCESS=true" >> $GITHUB_ENV
+          echo "✅ Done: ${ITEM_COUNT} item(s)"
+
+      # ── Step 8: Commit & Push ─────────────────────────
+      - name: "📤 Commit to Repository"
+        if: env.CACHE_HIT != 'true' && env.DOWNLOAD_SUCCESS == 'true'
+        env:
+          CHANNEL_NAME: ${{ env.CHANNEL_NAME }}
+          REPO_DIR: ${{ env.REPO_DIR }}
+          BRANCH: ${{ env.BRANCH }}
+        run: |
+          cd "$REPO_DIR"
+          git add telegram/
+          if git diff --staged --quiet; then
+            echo "✅ No changes"
+          else
+            git commit -m "feat(telegram): add ${CHANNEL_NAME} — ${ITEM_COUNT} items"
+            git pull --rebase origin ${BRANCH} || true
+            git push origin ${BRANCH}
+            echo "✅ Pushed"
+          fi
+
+      # ── Step 9: Stop WARP ─────────────────────────────
+      - name: "🛑 Stop WARP"
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
+
+      # ═══════════════════════════════════════════════════
+      # Step 10: Send Combined Message
+      # ═══════════════════════════════════════════════════
+      - name: "📬 Send Complete Result to User"
+        if: github.event.inputs.chat_id != '' && env.DOWNLOAD_SUCCESS == 'true'
+        env:
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CHANNEL_NAME: ${{ env.CHANNEL_NAME }}
+          MEDIA_TYPE_DETECTED: ${{ env.MEDIA_TYPE_DETECTED }}
+          ITEM_COUNT: ${{ env.ITEM_COUNT }}
+          TOTAL_SEGMENTS: ${{ env.TOTAL_SEGMENTS }}
+          THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
+          TG_URLS: ${{ env.TG_URLS }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
+          CACHE_HIT: ${{ env.CACHE_HIT }}
+          CACHED_CHANNEL: ${{ env.CACHED_CHANNEL }}
+          CACHED_MEDIA_TYPE: ${{ env.CACHED_MEDIA_TYPE }}
+          CACHED_THUMB: ${{ env.CACHED_THUMB }}
+          CACHED_VIEWS: ${{ env.CACHED_VIEWS }}
+        run: |
+          #!/bin/bash
+          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          
+          if [ "$CACHE_HIT" = "true" ]; then
+            CHANNEL_NAME_VAL="${CACHED_CHANNEL:-Unknown}"
+            MEDIA_TYPE_VAL="${CACHED_MEDIA_TYPE:-unknown}"
+            THUMB_URL="${CACHED_THUMB:-}"
+            ITEM_COUNT_VAL="1"
+            SEG_COUNT_VAL="1"
+            SPEED_TEXT="⚡ از حافظه کش ارسال شد | "
+          else
+            CHANNEL_NAME_VAL="${CHANNEL_NAME:-Unknown}"
+            MEDIA_TYPE_VAL="${MEDIA_TYPE_DETECTED:-unknown}"
+            THUMB_URL="${THUMBNAIL_URL:-}"
+            ITEM_COUNT_VAL="${ITEM_COUNT:-0}"
+            SEG_COUNT_VAL="${TOTAL_SEGMENTS:-1}"
+            SPEED_TEXT=""
+          fi
+          
+          # Media type icons
+          case "$MEDIA_TYPE_VAL" in
+            video) TYPE_ICON="🎬" ;;
+            audio) TYPE_ICON="🎵" ;;
+            text)  TYPE_ICON="📝" ;;
+            document) TYPE_ICON="📄" ;;
+            photo) TYPE_ICON="🖼️" ;;
+            *)     TYPE_ICON="📁" ;;
+          esac
+          
+          if [ -n "$CHANNEL_USERNAME" ]; then
+            CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
+          elif [ -n "$CHANNEL_ID" ]; then
+            CHANNEL_LINK="https://ble.ir/im/p/${CHANNEL_ID}"
+          else
+            CHANNEL_LINK="https://ble.ir"
+          fi
+          
+          [ "$SEG_COUNT_VAL" -gt 1 ] && SEGMENT_INFO="📦 *تعداد قسمت:* ${SEG_COUNT_VAL} (همه قابل پخش)" || SEGMENT_INFO=""
+          
+          CAPTION="${TYPE_ICON} *${CHANNEL_NAME_VAL}*
+          
+          📢 *کانال تلگرام*
+          📁 *نوع محتوا:* ${MEDIA_TYPE_VAL}
+          📊 *تعداد آیتم:* ${ITEM_COUNT_VAL}
+          ${SEGMENT_INFO}
+          
+          ✅ *دانلود کامل شد!* ${SPEED_TEXT}
+          📁 فایل در کانال آرشیو شما ذخیره شد.
+          
+          🔗 [مشاهده کانال تلگرام](${TG_URLS})"
+          
+          KEYBOARD=$(jq -n \
+            --arg channel_url "$CHANNEL_LINK" \
+            '{
+              inline_keyboard: [
+                [{text: "📂 دریافت فایل از کانال آرشیو", url: $channel_url}],
+                [{text: "🔙 بازگشت به منوی اصلی", callback_data: "back_to_main"}]
+              ]
+            }')
+          
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -R -s '.')
+          ESCAPED_KEYBOARD=$(echo "$KEYBOARD" | jq -c '.')
+          
+          PHOTO_SENT=false
+          if [ "$MEDIA_TYPE_VAL" != "text" ] && [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
+            echo "🖼️ Sending photo with caption via JSON..."
+            PHOTO_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendPhoto" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"photo\": \"${THUMB_URL}\",
+                \"caption\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              PHOTO_SENT=true
+              echo "  ✅ Photo sent successfully"
+            else
+              echo "  ⚠️ Photo failed, trying text fallback..."
+            fi
+          fi
+          
+          if [ "$PHOTO_SENT" = false ]; then
+            echo "📝 Sending as text message via JSON..."
+            TEXT_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${CHAT_ID}\",
+                \"text\": ${ESCAPED_CAPTION},
+                \"parse_mode\": \"Markdown\",
+                \"reply_markup\": ${ESCAPED_KEYBOARD}
+              }")
+            
+            if echo "$TEXT_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
+              echo "  ✅ Text sent successfully"
+            else
+              echo "  ❌ Text also failed: $TEXT_RESPONSE"
+            fi
+          fi
+          
+          echo "✅ Complete result sent to user"
+
+      # ═══════════════════════════════════════════════════
+      # Step 11: Upload to Channel
+      # ═══════════════════════════════════════════════════
+      - name: "📤 Upload to User's Channel"
+        if: github.event.inputs.channel_id != '' && env.DOWNLOAD_SUCCESS == 'true'
+        env:
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          BACKUP_DIR: ${{ env.BACKUP_DIR }}
+          QUALITY: ${{ env.QUALITY }}
+          MEDIA_TYPE: ${{ env.MEDIA_TYPE }}
+        run: |
+          #!/bin/bash
+          API="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          echo "📤 Uploading to Bale channel..."
+          
+          for CHANNEL_FOLDER in "$BACKUP_DIR"/*/; do
+            [ -d "$CHANNEL_FOLDER" ] || continue
+            CHANNEL_NAME=$(basename "$CHANNEL_FOLDER")
+            
+            for FILE in "$CHANNEL_FOLDER"/segments/* "$CHANNEL_FOLDER"/*; do
+              [ -f "$FILE" ] || continue
+              [[ "$FILE" == *.jpg ]] && continue
+              FILENAME=$(basename "$FILE")
+              EXT="${FILENAME##*.}"
+              
+              echo "  📄 $FILENAME"
+              
+              case "$EXT" in
+                mp3|m4a|ogg|wav|flac|aac)
+                  curl -s -X POST "${API}/sendAudio" -F "chat_id=${CHANNEL_ID}" \
+                    -F "audio=@${FILE}" -F "caption=" > /dev/null 2>&1
+                  ;;
+                mp4|webm|mkv|mov|avi)
+                  curl -s -X POST "${API}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
+                    -F "video=@${FILE}" -F "caption=" > /dev/null 2>&1
+                  ;;
+                txt|html|json|xml|csv|md)
+                  # For text files, read and send as message
+                  TEXT_CONTENT=$(head -c 3500 "$FILE" 2>/dev/null || echo "")
+                  if [ -n "$TEXT_CONTENT" ]; then
+                    jq -n --arg chat_id "$CHANNEL_ID" --arg text "$TEXT_CONTENT" \
+                      '{chat_id: $chat_id, text: $text}' > /tmp/text_upload.json
+                    curl -s -X POST "${API}/sendMessage" \
+                      -H "Content-Type: application/json" \
+                      -d @/tmp/text_upload.json > /dev/null 2>&1
+                  fi
+                  ;;
+                *)
+                  curl -s -X POST "${API}/sendDocument" -F "chat_id=${CHANNEL_ID}" \
+                    -F "document=@${FILE}" -F "caption=" > /dev/null 2>&1
+                  ;;
+              esac
+              echo "    ✅"
+              sleep 3
+            done
+          done
+          echo "✅ Uploads done"
