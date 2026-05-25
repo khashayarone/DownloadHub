@@ -152,11 +152,11 @@ jobs:
           echo "TMP_DIR=/tmp/ig_downloads_$$" >> $GITHUB_ENV
           mkdir -p /tmp/ig_downloads_$$
 
-          case "${QUALITY}" in
-            720)   FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
-            480)   FORMAT="bestvideo[height<=720]+bestaudio/bestvideo[height<=720]*+bestaudio*/best" ;;
-            *)     FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
-          esac
+            case "${QUALITY}" in
+              720)   FORMAT="bv*+ba*/b" ;;
+              480)   FORMAT="bv[height<=720]+ba/b" ;;
+              *)     FORMAT="bv*+ba*/b" ;;
+            esac
           echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
 
           if [ "$DOWNLOAD_TYPE" = "all_posts" ]; then
