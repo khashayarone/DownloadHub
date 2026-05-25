@@ -1,23 +1,23 @@
 # ============================================================
-# instagram-dl.yml — Bale Instagram Downloader V5
-# Repository: github.com/khashayardev/DownloadHub
+# instagram-dl.yml — Bale Instagram Downloader V6
+# Repository: github.com/khashayarone/DownloadHub
 # ============================================================
-# Features V5:
+# Features V6:
 #   ۱. Download posts, reels, stories, IGTV (video only)
 #   ۲. Quality mapping: 720→best, 480→medium
 #   ۳. Two-Layer Cache compatible (notifies bot via /cache)
 #   ۴. Premium-aware: >45MB split into .partX.rar
 #   ۵. Free users: >45MB notification with back button
 #   ۶. Combined single message (thumbnail + caption + channel + back)
-#   ۷. Direct upload via sendVideo / sendDocument (for RAR parts)
+#   ۷. Direct upload via sendVideo / sendDocument (RAR parts)
 #   ۸. /cache notification with multipart support
-#   ۹. WinRAR split volumes for large videos
+#   ۹. WinRAR split volumes (.part1.rar, .part2.rar, ...)
 #   ۱۰. No repo storage — direct upload only
-#   ۱۱. Caption: 👤 username | 📸 Instagram | 🔗 link
+#   ۱۱. Caption on channel files: empty (like YouTube)
 #   ۱۲. Compatible with Bale DownloadHub Bot v7
 # ============================================================
 
-name: "📸 Instagram Downloader V5"
+name: "📸 Instagram Downloader V6"
 
 on:
   workflow_dispatch:
@@ -248,7 +248,7 @@ jobs:
           TMP_DIR="tmp_ig_$$"
           mkdir -p "$TMP_DIR"
 
-          # Download — same as working V2, with merge-output-format mp4
+          # Download — single method (like YouTube but simpler)
           yt-dlp --proxy "socks5://127.0.0.1:1080" \
             --format "$FORMAT" \
             --merge-output-format mp4 \
@@ -270,30 +270,21 @@ jobs:
               --concurrent-fragments 8 --progress --newline "$IG_URL" 2>&1
           }
 
-          CAPTION_TEXT="👤 ${USERNAME} | 📸 Instagram | 🔗 ${IG_URL}"
-
-          ITEM_COUNT=0
-          FIRST_FILE_ID=""
-          FIRST_MESSAGE_ID=0
-
-          # Process files — EXACTLY like working V2: skip jpg/webp, keep video files
-          for MEDIA_FILE in "$TMP_DIR"/*; do
+          # Process files — exactly like YouTube
+          for MEDIA_FILE in "$TMP_DIR"/*.mp4 "$TMP_DIR"/*.webm "$TMP_DIR"/*.mkv; do
             [ -f "$MEDIA_FILE" ] || continue
-
-            # Skip thumbnails — this is what made V2 work
-            [[ "$MEDIA_FILE" == *.jpg ]] && continue
-            [[ "$MEDIA_FILE" == *.webp ]] && continue
 
             BASENAME=$(basename "$MEDIA_FILE")
             SAFE_NAME=$(sanitize_name "${BASENAME%.*}")
             EXT="${BASENAME##*.}"
             FILE_SIZE=$(stat -c%s "$MEDIA_FILE" 2>/dev/null || echo 0)
 
-            echo "  📦 ${BASENAME} — $(( FILE_SIZE / 1024 / 1024 ))MB"
+            echo "  📦 ${SAFE_NAME}.${EXT} — $(( FILE_SIZE / 1024 / 1024 ))MB"
 
+            # ═══ SIZE CHECK ═══
             if [ "$FILE_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
               if [ "$IS_PREMIUM" = "true" ]; then
-                echo "  ⭐ Premium — splitting with RAR..."
+                echo "  ⭐ Premium user — splitting with RAR..."
                 SPLIT_DIR="/tmp/rar_split_$$"
                 mkdir -p "$SPLIT_DIR"
                 cp "$MEDIA_FILE" "${SPLIT_DIR}/${SAFE_NAME}.${EXT}"
@@ -304,59 +295,57 @@ jobs:
 
                 TOTAL_PARTS=$(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar 2>/dev/null | wc -l)
                 if [ "$TOTAL_PARTS" -gt "$MAX_PARTS" ]; then
-                  echo "  ⚠️ Too many parts — rejecting"
-                  [ -n "$CHAT_ID" ] && notify_oversized "${BASENAME}" "$FILE_SIZE" "$IG_URL"
+                  echo "  ⚠️ Too many parts (${TOTAL_PARTS}) — rejecting"
+                  [ -n "$CHAT_ID" ] && notify_oversized "${SAFE_NAME}.${EXT}" "$FILE_SIZE" "$IG_URL"
                   rm -rf "$SPLIT_DIR"
                   continue
                 fi
 
                 echo "  📦 Split into ${TOTAL_PARTS} RAR parts"
                 PART_NUM=0
+                FIRST_MESSAGE_ID=0
+                FIRST_FILE_ID=""
+
                 for PART_FILE in $(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar | sort); do
                   [ -f "$PART_FILE" ] || continue
                   PART_NUM=$((PART_NUM + 1))
-                  echo "  📤 Uploading part ${PART_NUM}/${TOTAL_PARTS}"
+                  PART_NAME=$(basename "$PART_FILE")
+                  echo "  📤 Uploading part ${PART_NUM}/${TOTAL_PARTS}: ${PART_NAME}"
                   UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendDocument" \
-                    -F "chat_id=${CHANNEL_ID}" -F "document=@${PART_FILE}" -F "caption= ")
+                    -F "chat_id=${CHANNEL_ID}" -F "document=@${PART_FILE}" -F "caption=")
                   MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
                   FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.document.file_id // ""')
-                  [ "$PART_NUM" -eq 1 ] && [ -z "$FIRST_FILE_ID" ] && { FIRST_MESSAGE_ID=$MESSAGE_ID; FIRST_FILE_ID=$FILE_ID; }
-                  [ "$MESSAGE_ID" != "0" ] && echo "    ✅ Part ${PART_NUM}" || echo "    ❌ Part ${PART_NUM}"
+                  [ "$PART_NUM" -eq 1 ] && { FIRST_MESSAGE_ID=$MESSAGE_ID; FIRST_FILE_ID=$FILE_ID; }
+                  [ "$MESSAGE_ID" != "0" ] && echo "    ✅ Part ${PART_NUM} uploaded (msg_id: ${MESSAGE_ID})" || echo "    ❌ Part ${PART_NUM} upload failed"
                   sleep 2
                 done
 
                 [ -n "$CHAT_ID" ] && [ -n "$FIRST_FILE_ID" ] && [ "$FIRST_MESSAGE_ID" != "0" ] && \
                   notify_cache "instagram" "$IG_URL" "$QUALITY" "$FIRST_FILE_ID" "${CHANNEL_ID}" "$FIRST_MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "1" "$TOTAL_PARTS"
-                [ -n "$CHAT_ID" ] && notify_multipart_info "${BASENAME}" "$TOTAL_PARTS" "$IG_URL"
+                [ -n "$CHAT_ID" ] && notify_multipart_info "${SAFE_NAME}.${EXT}" "$TOTAL_PARTS" "$IG_URL"
                 rm -rf "$SPLIT_DIR"
-                ITEM_COUNT=$((ITEM_COUNT + TOTAL_PARTS))
               else
                 echo "  ⚠️ Free user — >45MB rejected"
-                [ -n "$CHAT_ID" ] && notify_oversized "${BASENAME}" "$FILE_SIZE" "$IG_URL"
+                [ -n "$CHAT_ID" ] && notify_oversized "${SAFE_NAME}.${EXT}" "$FILE_SIZE" "$IG_URL"
               fi
             else
+              # ═══ ≤45MB: Direct upload ═══
               if [ -n "$CHANNEL_ID" ]; then
-                echo "  📤 Uploading to channel..."
                 UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendVideo" \
-                  -F "chat_id=${CHANNEL_ID}" -F "video=@${MEDIA_FILE}" -F "caption= ")
-
+                  -F "chat_id=${CHANNEL_ID}" -F "video=@${MEDIA_FILE}" -F "caption=")
                 FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.video.file_id // ""')
                 MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
 
                 if [ -n "$FILE_ID" ] && [ "$MESSAGE_ID" != "0" ]; then
                   echo "  ✅ Uploaded (msg_id: $MESSAGE_ID)"
-                  [ -z "$FIRST_FILE_ID" ] && { FIRST_FILE_ID=$FILE_ID; FIRST_MESSAGE_ID=$MESSAGE_ID; }
+                  [ -n "$CHAT_ID" ] && notify_cache "instagram" "$IG_URL" "$QUALITY" "$FILE_ID" "${CHANNEL_ID}" "$MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "0" "1"
                 else
-                  echo "  ❌ Upload failed"
+                  echo "  ❌ Upload failed: $UPLOAD_RESPONSE"
                 fi
                 sleep 2
-                ITEM_COUNT=$((ITEM_COUNT + 1))
               fi
             fi
           done
-
-          [ -n "$CHAT_ID" ] && [ -n "$FIRST_FILE_ID" ] && [ "$FIRST_MESSAGE_ID" != "0" ] && \
-            notify_cache "instagram" "$IG_URL" "$QUALITY" "$FIRST_FILE_ID" "${CHANNEL_ID}" "$FIRST_MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "0" "1"
 
           rm -rf "$TMP_DIR"
 
@@ -364,7 +353,6 @@ jobs:
           echo "TRACK_TITLE=${TITLE}" >> $GITHUB_ENV
           echo "LIKE_COUNT=${LIKE_COUNT}" >> $GITHUB_ENV
           echo "THUMBNAIL_URL=${THUMBNAIL_URL}" >> $GITHUB_ENV
-          echo "ITEM_COUNT=${ITEM_COUNT}" >> $GITHUB_ENV
 
           done
 
@@ -386,7 +374,6 @@ jobs:
           TRACK_TITLE: ${{ env.TRACK_TITLE }}
           LIKE_COUNT: ${{ env.LIKE_COUNT }}
           THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
-          ITEM_COUNT: ${{ env.ITEM_COUNT }}
           CHANNEL_ID: ${{ github.event.inputs.channel_id }}
           CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
         run: |
@@ -397,7 +384,6 @@ jobs:
           TITLE_NAME="${TRACK_TITLE:-Untitled}"
           THUMB_URL="${THUMBNAIL_URL:-}"
           LIKE_VAL="${LIKE_COUNT:-0}"
-          ITEM_COUNT_VAL="${ITEM_COUNT:-1}"
 
           if [ "$LIKE_VAL" != "0" ] && [ "$LIKE_VAL" != "null" ] && [ "$LIKE_VAL" -gt 0 ] 2>/dev/null; then
             if [ "$LIKE_VAL" -gt 1000000 ]; then LIKES_FMT="$(echo "scale=1; $LIKE_VAL/1000000" | bc)M"
@@ -420,7 +406,7 @@ jobs:
           👤 *کاربر:* ${USER_NAME}
           ❤️ *لایک:* ${LIKES_FMT}
 
-          ✅ *دانلود کامل شد!* 📸 *تعداد:* ${ITEM_COUNT_VAL}
+          ✅ *دانلود کامل شد!*
           📁 فایل در کانال آرشیو شما ذخیره شد.
 
           🔗 [مشاهده در Instagram](${IG_URLS})"
