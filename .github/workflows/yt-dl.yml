@@ -1,43 +1,40 @@
 # ============================================================
-# yt-dl.yml — Bale YouTube Downloader V3
+# yt-dl.yml — Bale YouTube Downloader V5 (Premium + RAR Split)
 # Repository: github.com/khashayardev/DownloadHub
 # ============================================================
-# Features V3:
-#   ۱. 8 bypass methods + Deno JS solver
-#   ۲. Cache system — checks repo before downloading (instant skip)
+# Features V5:
+#   ۱. 6 bypass methods + Deno JS solver
+#   ۲. Two-Layer Cache compatible (notifies bot via /cache)
 #   ۳. Full playlist & channel download
-#   ۴. Multiple quality options (audio, 480p → 4K)
-#   ۵. Subtitle download (fa & en) with auto-retry
-#   ۶. Genre-based folder organization
-#   ۷. Rich creator info in creator_info.json
-#   ۸. Smart README with video list, quality, stats
-#   ۹. Thumbnail as photo in Bale + formatted Persian caption
-#   ۱۰. Video file sent as sendVideo (music player for audio)
-#   ۱۱. No zip/split — direct upload
-#   ۱۲. Dedicated folder per platform: youtube/creator-slug/
+#   ۴. Quality mapping: 720→best, 480→480p, audio→MP3
+#   ۵. Subtitle download (fa & en)
+#   ۶. Premium-aware: >45MB split into .partX.rar for premium users
+#   ۷. Free users: >45MB notification with back button
+#   ۸. Combined single message (thumbnail + caption + channel + back)
+#   ۹. Direct upload via sendVideo/sendAudio/sendDocument
+#   ۱۰. /cache notification with multipart support
+#   ۱۱. WinRAR split volumes (.part1.rar, .part2.rar, ...)
+#   ۱۲. No repo storage — direct upload only
+#   ۱۳. Compatible with Bale DownloadHub Bot v6
 # ============================================================
 
-name: "🎬 YouTube Downloader"
+name: "🎬 YouTube Downloader V5"
 
 on:
   workflow_dispatch:
     inputs:
       youtube_urls:
-        description: "🔗 YouTube URL(s) — separate with space"
+        description: "🔗 YouTube URL(s)"
         required: true
         type: string
       quality:
-        description: "🎬 Video Quality"
+        description: "📹 Quality (720=best, 480=480p, audio=MP3)"
         required: false
         type: choice
-        default: "best"
+        default: "720"
         options:
-          - best
-          - 2160
-          - 1440
-          - 1080
-          - 720
-          - 480
+          - "720"
+          - "480"
           - audio
       download_type:
         description: "📋 Download Type"
@@ -49,22 +46,22 @@ on:
           - playlist
           - all_channel
       max_items:
-        description: "🔢 Max Items (for playlist/channel)"
+        description: "🔢 Max Items"
         required: false
         type: string
         default: "10"
       download_subtitles:
-        description: "📝 Download Subtitles (fa & en)"
+        description: "📝 Subtitles (fa & en)"
         required: false
         type: boolean
         default: false
       chat_id:
-        description: "🆔 User Chat ID for notification"
+        description: "🆔 User Chat ID"
         required: false
         type: string
         default: ""
       channel_id:
-        description: "📢 Channel ID for archiving"
+        description: "📢 Channel ID"
         required: false
         type: string
         default: ""
@@ -73,19 +70,28 @@ on:
         required: false
         type: string
         default: ""
+      is_premium:
+        description: "⭐ Premium user? (true/false)"
+        required: false
+        type: string
+        default: "false"
 
 env:
   PROJECT_NAME: "Khashayar Downloader"
   PROJECT_URL: "https://khashayar.one"
   PLATFORM: "youtube"
+  TARGET_SIZE_MB: 45
+  TARGET_SIZE_BYTES: 47185920
+  ADMIN_CHAT_ID: "241726352"
+  MAX_PARTS: 20
 
 jobs:
   download:
-    name: "🎬 Download & Store"
+    name: "🎬 Download & Upload"
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
-      contents: write
+      contents: read
       actions: read
 
     steps:
@@ -102,9 +108,6 @@ jobs:
           git config --global http.postBuffer 524288000
           git config --global http.maxRequestBuffer 100M
           git config --global core.compression 0
-          git config --global pack.windowMemory 256m
-          git config --global pack.packSizeLimit 100m
-          git config --global pack.threads 1
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -112,8 +115,7 @@ jobs:
       - name: "🌐 Setup Cloudflare WARP"
         run: |
           docker network create warp-net 2>/dev/null || true
-          docker run -d \
-            --name warp --restart=no --network warp-net \
+          docker run -d --name warp --restart=no --network warp-net \
             -p 1080:1080 --cap-add NET_ADMIN \
             --sysctl net.ipv6.conf.all.disable_ipv6=0 \
             --sysctl net.ipv4.conf.all.src_valid_mark=1 \
@@ -129,16 +131,15 @@ jobs:
       - name: "📦 Install Dependencies"
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-pip ffmpeg zip curl jq bc unzip
+          sudo apt-get install -y -qq python3-pip ffmpeg curl jq bc rar
           curl -fsSL https://deno.land/install.sh | sh
           export DENO_INSTALL="$HOME/.deno"
           export PATH="$DENO_INSTALL/bin:$PATH"
           echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
-          deno --version
           pip3 install --upgrade yt-dlp --quiet
 
       # ── Step 5: Setup Parameters ──────────────────────
-      - name: "🔧 Setup Download Parameters"
+      - name: "🔧 Setup Parameters"
         id: setup
         env:
           YT_URLS: ${{ github.event.inputs.youtube_urls }}
@@ -146,48 +147,38 @@ jobs:
           YT_TYPE: ${{ github.event.inputs.download_type }}
           YT_MAX: ${{ github.event.inputs.max_items }}
           YT_SUBS: ${{ github.event.inputs.download_subtitles }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-          BRANCH: ${{ github.ref_name }}
+          YT_PREMIUM: ${{ github.event.inputs.is_premium }}
         run: |
           YT_URLS="${YT_URLS}"
           QUALITY="${YT_QUALITY}"
           DOWNLOAD_TYPE="${YT_TYPE}"
           MAX_ITEMS="${YT_MAX}"
           DOWNLOAD_SUBS="${YT_SUBS}"
+          IS_PREMIUM="${YT_PREMIUM}"
           
           echo "════════════════════════════════════════"
           echo "  $PROJECT_NAME | $PROJECT_URL"
           echo "════════════════════════════════════════"
           echo "🎬 URLs: ${YT_URLS}"
-          echo "🎬 Quality: ${QUALITY} | Type: ${DOWNLOAD_TYPE} | Max: ${MAX_ITEMS}"
-          echo "📝 Subtitles: ${DOWNLOAD_SUBS}"
+          echo "📹 Quality: ${QUALITY} | Type: ${DOWNLOAD_TYPE} | Max: ${MAX_ITEMS}"
+          echo "⭐ Premium: ${IS_PREMIUM}"
           
           echo "YT_URLS=${YT_URLS}" >> $GITHUB_ENV
           echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
           echo "DOWNLOAD_TYPE=${DOWNLOAD_TYPE}" >> $GITHUB_ENV
           echo "MAX_ITEMS=${MAX_ITEMS}" >> $GITHUB_ENV
           echo "DOWNLOAD_SUBS=${DOWNLOAD_SUBS}" >> $GITHUB_ENV
-          echo "REPO_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
-          echo "BACKUP_DIR=/tmp/yt_downloads_$$" >> $GITHUB_ENV
-          echo "CACHE_INDEX=${GITHUB_WORKSPACE}/youtube/cache_index.json" >> $GITHUB_ENV
+          echo "IS_PREMIUM=${IS_PREMIUM}" >> $GITHUB_ENV
+          echo "TMP_DIR=/tmp/yt_downloads_$$" >> $GITHUB_ENV
           
           mkdir -p /tmp/yt_downloads_$$
-          mkdir -p "${GITHUB_WORKSPACE}/youtube"
           
-          if [ ! -f "${GITHUB_WORKSPACE}/youtube/cache_index.json" ]; then
-            echo '{}' > "${GITHUB_WORKSPACE}/youtube/cache_index.json"
-          fi
-          
+          # Quality mapping: 720→best, 480→480p, audio→audio
           case "${QUALITY}" in
             audio) FORMAT="bestaudio/bestaudio*/best" ;;
-            best)  FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
-            2160|4k) FORMAT="bestvideo[height<=2160]+bestaudio/bestvideo[height<=2160]*+bestaudio*/bestvideo[height<=2160]+bestaudio/best[height<=2160]" ;;
-            1440|2k) FORMAT="bestvideo[height<=1440]+bestaudio/bestvideo[height<=1440]*+bestaudio*/bestvideo[height<=1440]+bestaudio/best[height<=1440]" ;;
-            1080) FORMAT="bestvideo[height<=1080]+bestaudio/bestvideo[height<=1080]*+bestaudio*/bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
-            720)  FORMAT="bestvideo[height<=720]+bestaudio/bestvideo[height<=720]*+bestaudio*/bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
-            480)  FORMAT="bestvideo[height<=480]+bestaudio/bestvideo[height<=480]*+bestaudio*/bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
-            *)    FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
+            720)   FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
+            480)   FORMAT="bestvideo[height<=480]+bestaudio/bestvideo[height<=480]*+bestaudio*/bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
+            *)     FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
           esac
           echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
           
@@ -197,64 +188,31 @@ jobs:
             PLAYLIST_FLAG="--no-playlist"
           fi
           echo "PLAYLIST_FLAG=${PLAYLIST_FLAG}" >> $GITHUB_ENV
-          
           echo "✅ Setup complete"
 
-      # ═══════════════════════════════════════════════════
-      # Step 5.5: Cache Check
-      # ═══════════════════════════════════════════════════
-      - name: "🔍 Cache Check — Skip Existing"
-        id: cache_check
-        run: |
-          #!/bin/bash
-          set -e
-          
-          YT_URLS="${{ env.YT_URLS }}"
-          CACHE_INDEX="${{ env.CACHE_INDEX }}"
-          REPO_DIR="${{ env.REPO_DIR }}"
-          
-          VIDEO_ID=$(echo "$YT_URLS" | grep -oE '[a-zA-Z0-9_-]{11}' | head -1 || echo "")
-          
-          if [ -n "$VIDEO_ID" ]; then
-            CACHED_PATH=$(jq -r ".\"${VIDEO_ID}\".path // empty" "$CACHE_INDEX" 2>/dev/null || echo "")
-            
-            if [ -n "$CACHED_PATH" ] && [ -f "${REPO_DIR}/${CACHED_PATH}" ]; then
-              echo "✅ ALREADY CACHED: ${CACHED_PATH}"
-              echo "CACHE_HIT=true" >> $GITHUB_ENV
-              echo "CACHED_FILE=${CACHED_PATH}" >> $GITHUB_ENV
-              echo "CACHED_CREATOR=$(jq -r ".\"${VIDEO_ID}\".creator // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
-              echo "CACHED_TITLE=$(jq -r ".\"${VIDEO_ID}\".title // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
-              echo "CACHED_THUMB=$(jq -r ".\"${VIDEO_ID}\".thumbnail // \"\"" "$CACHE_INDEX")" >> $GITHUB_ENV
-              echo "CACHED_DURATION=$(jq -r ".\"${VIDEO_ID}\".duration // 0" "$CACHE_INDEX")" >> $GITHUB_ENV
-              echo "CACHED_VIEWS=$(jq -r ".\"${VIDEO_ID}\".views // 0" "$CACHE_INDEX")" >> $GITHUB_ENV
-            else
-              echo "🆕 Not in cache — will download"
-              echo "CACHE_HIT=false" >> $GITHUB_ENV
-            fi
-          else
-            echo "⚠️ Could not extract video ID"
-            echo "CACHE_HIT=false" >> $GITHUB_ENV
-          fi
-
-      # ═══════════════════════════════════════════════════
-      # Step 6: Download & Process (SKIP if cache hit)
-      # ═══════════════════════════════════════════════════
-      - name: "🎬 Download & Process Videos"
+      # ── Step 6: Download & Process ────────────────────
+      - name: "🎬 Download & Process"
         id: download
-        if: env.CACHE_HIT != 'true'
         env:
-          BACKUP_DIR: ${{ env.BACKUP_DIR }}
           FORMAT: ${{ env.FORMAT }}
           QUALITY: ${{ env.QUALITY }}
           PLAYLIST_FLAG: ${{ env.PLAYLIST_FLAG }}
           YT_URLS: ${{ env.YT_URLS }}
           DOWNLOAD_SUBS: ${{ env.DOWNLOAD_SUBS }}
-          REPO_DIR: ${{ env.REPO_DIR }}
-          CACHE_INDEX: ${{ env.CACHE_INDEX }}
+          IS_PREMIUM: ${{ env.IS_PREMIUM }}
+          TMP_DIR: ${{ env.TMP_DIR }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
         run: |
           #!/bin/bash
           shopt -s nullglob
           set -e
+          
+          TARGET_SIZE_BYTES=$(( 45 * 1024 * 1024 ))
+          BALE_API="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          ADMIN_ID="${ADMIN_CHAT_ID}"
+          MAX_PARTS="${MAX_PARTS}"
           
           sanitize_name() {
             local name="$1"
@@ -266,25 +224,43 @@ jobs:
           
           format_number() {
             local num=$1
-            if [ -z "$num" ] || [ "$num" = "null" ]; then echo "0"; return; fi
-            if [ "$num" -gt 1000000 ] 2>/dev/null; then echo "$(echo "scale=1; $num / 1000000" | bc)M"
-            elif [ "$num" -gt 1000 ] 2>/dev/null; then echo "$(echo "scale=1; $num / 1000" | bc)K"
-            else echo "$num"; fi
+            [ -z "$num" ] || [ "$num" = "null" ] && echo "0" && return
+            [ "$num" -gt 1000000 ] 2>/dev/null && echo "$(echo "scale=1; $num/1000000" | bc)M" && return
+            [ "$num" -gt 1000 ] 2>/dev/null && echo "$(echo "scale=1; $num/1000" | bc)K" && return
+            echo "$num"
           }
           
-          normalize_youtube_url() {
-            local URL="$1"
-            if [[ "$URL" =~ youtu\.be/([a-zA-Z0-9_-]+) ]]; then
-              echo "https://www.youtube.com/watch?v=${BASH_REMATCH[1]%%\?*}"
-            else
-              echo "$URL"
-            fi
+          notify_oversized() {
+            local fname="$1" fsize="$2" url="$3"
+            local fsize_mb=$(( fsize / 1024 / 1024 ))
+            local caption="⚠️ *فایل بیشتر از ۴۵ مگابایت است!*\n\n📁 *نام:* ${fname}\n📦 *حجم:* ${fsize_mb}MB\n🔗 *لینک:* ${url}\n\n❌ امکان دانلود در نسخه رایگان وجود ندارد.\n⭐ با خرید اشتراک پریمیوم محدودیت حجم برداشته میشود."
+            local kb='{"inline_keyboard":[[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$caption" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${kb}}" > /dev/null 2>&1
+            echo "  📤 Sent >45MB notification"
+          }
+          
+          notify_multipart_info() {
+            local fname="$1" total_parts="$2" url="$3"
+            local caption="📦 *فایل به ${total_parts} پارت ۴۵MB تقسیم شد.*\n\n📁 *نام:* ${fname}\n📥 همه پارت‌ها را دانلود کنید، سپس *پارت ۱* را Extract کنید.\n\n🔗 *لینک:* ${url}"
+            local kb='{"inline_keyboard":[[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$caption" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${kb}}" > /dev/null 2>&1
+            echo "  📤 Sent multipart info"
+          }
+          
+          notify_cache() {
+            local platform="$1" url="$2" quality="$3" file_id="$4" channel_id="$5" message_id="$6" file_size="$7" file_name="$8" is_multipart="$9" total_parts="${10}"
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${ADMIN_ID}\",\"text\":\"/cache ${platform} ${url} ${quality} ${file_id} ${channel_id} ${message_id} ${file_size} ${file_name} ${is_multipart} ${total_parts}\"}" > /dev/null 2>&1
+            echo "  📤 Cache notification sent"
           }
           
           download_video() {
             local METHOD=$1 URL=$2 TMP_DIR=$3
-            echo "  🔄 Method $METHOD..."
-            
             if [ "$QUALITY" = "audio" ]; then
               COMMON_FLAGS="--extract-audio --audio-format mp3 --audio-quality 0 --write-thumbnail --convert-thumbnails jpg --no-cache-dir --output ${TMP_DIR}/%(title)s.%(ext)s --no-part --no-playlist --retries 5 --fragment-retries 5 --no-check-certificates --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M --progress --newline"
             else
@@ -292,14 +268,12 @@ jobs:
             fi
             
             case $METHOD in
-              1) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" --add-header "Accept-Language:en-US,en;q=0.9" "$URL" ;;
-              2) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:npm --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" --add-header "Accept-Language:en-US,en;q=0.9" "$URL" ;;
-              3) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$URL" ;;
-              4) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=mweb" "$URL" ;;
-              5) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=android_vr" "$URL" ;;
-              6) yt-dlp --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" ;;
-              7) yt-dlp --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=mweb" "$URL" ;;
-              8) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=android" --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" "$URL" ;;
+              1) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36" "$URL" 2>&1 ;;
+              2) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=web,mweb,android_vr" --js-runtimes deno --remote-components ejs:github "$URL" 2>&1 ;;
+              3) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=mweb" "$URL" 2>&1 ;;
+              4) yt-dlp --proxy "socks5://127.0.0.1:1080" --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=android_vr" "$URL" 2>&1 ;;
+              5) yt-dlp --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG --extractor-args "youtube:player_client=web" --js-runtimes deno --remote-components ejs:github "$URL" 2>&1 ;;
+              6) yt-dlp --format "$FORMAT" $COMMON_FLAGS $PLAYLIST_FLAG "$URL" 2>&1 ;;
               *) return 1 ;;
             esac
           }
@@ -309,67 +283,32 @@ jobs:
           
           for YT_URL in "${URL_ARRAY[@]}"; do
           
-          YT_URL=$(normalize_youtube_url "$YT_URL")
+          # Normalize URL
+          if [[ "$YT_URL" =~ youtu\.be/([a-zA-Z0-9_-]+) ]]; then
+            YT_URL="https://www.youtube.com/watch?v=${BASH_REMATCH[1]%%\?*}"
+          fi
           
-          echo "🔍 Fetching metadata for: $YT_URL"
-          
+          echo "🔍 Fetching metadata: $YT_URL"
           INFO_JSON=$(yt-dlp --proxy "socks5://127.0.0.1:1080" --dump-json --skip-download "$YT_URL" 2>/dev/null || echo "{}")
           
-          CREATOR=$(echo "$INFO_JSON" | jq -r '.uploader // .channel // "Unknown Creator"')
+          CREATOR=$(echo "$INFO_JSON" | jq -r '.uploader // .channel // "Unknown"')
           TITLE=$(echo "$INFO_JSON" | jq -r '.title // "Untitled"')
-          VIDEO_ID=$(echo "$INFO_JSON" | jq -r '.id // ""')
           DURATION=$(echo "$INFO_JSON" | jq -r '.duration // 0')
           VIEW_COUNT=$(echo "$INFO_JSON" | jq -r '.view_count // 0')
-          LIKE_COUNT=$(echo "$INFO_JSON" | jq -r '.like_count // 0')
           THUMBNAIL_URL=$(echo "$INFO_JSON" | jq -r '.thumbnail // ""')
           
-          echo "  👤 Creator: $CREATOR"
-          echo "  📝 Title: $TITLE"
-          echo "  👁 Views: $VIEW_COUNT"
-          
-          CREATOR_SLUG=$(sanitize_name "$CREATOR")
-          VIDEO_SLUG=$(sanitize_name "$TITLE")
-          
-          CREATOR_DIR="${REPO_DIR}/youtube/${CREATOR_SLUG}"
-          mkdir -p "$CREATOR_DIR"
-          
-          printf '{\n  "creator": "%s",\n  "creator_url": "%s",\n  "total_views": %s,\n  "total_likes": %s,\n  "last_updated": "%s"\n}\n' \
-            "$CREATOR" \
-            "$(echo "$INFO_JSON" | jq -r '.uploader_url // ""')" \
-            "${VIEW_COUNT:-0}" \
-            "${LIKE_COUNT:-0}" \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            > "${CREATOR_DIR}/creator_info.json"
-          echo "  📝 Updated creator_info.json"
+          echo "  👤 $CREATOR | 📝 $TITLE | 👁 $(format_number $VIEW_COUNT)"
           
           TMP_DIR="tmp_yt_$$"
           mkdir -p "$TMP_DIR"
-          echo "⬇️ Downloading: $TITLE"
           
           DOWNLOAD_SUCCESS=false
-          for METHOD in 1 2 3 4 5 6 7 8; do
-            if download_video $METHOD "$YT_URL" "$TMP_DIR"; then
-              echo "  ✅ Downloaded (method $METHOD)!"
-              
-              # Quality Gate — reject if resolution too low
-              QUALITY_OK=true
-              if [ "$QUALITY" != "best" ] && [ "$QUALITY" != "audio" ]; then
-                for DF in "$TMP_DIR"/*.mp4 "$TMP_DIR"/*.webm "$TMP_DIR"/*.mkv; do
-                  [ -f "$DF" ] || continue
-                  AH=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$DF" 2>/dev/null || echo "unknown")
-                  echo "  🎯 Requested: ${QUALITY}p | Got: ${AH}px"
-                  if [ "$AH" != "unknown" ] && [ "$AH" -lt $(( QUALITY - 150 )) ] 2>/dev/null; then
-                    echo "  ⚠️ Too low — rejecting"; QUALITY_OK=false; rm -f "$DF"
-                  fi
-                done
-              fi
-              
-              if [ "$QUALITY_OK" = true ]; then
-                DOWNLOAD_SUCCESS=true; break
-              fi
+          for METHOD in 1 2 3 4 5 6; do
+            if download_video $METHOD "$YT_URL" "$TMP_DIR" | grep -q "100%"; then
+              echo "  ✅ Downloaded (method $METHOD)"
+              DOWNLOAD_SUCCESS=true; break
             else
-              echo "  ❌ Method $METHOD failed"
-              sleep 2
+              echo "  ❌ Method $METHOD failed"; sleep 2
             fi
           done
           
@@ -379,144 +318,151 @@ jobs:
             continue
           fi
           
-          VIDEO_COUNT=0
+          # Process files
           for MEDIA_FILE in "$TMP_DIR"/*.mp4 "$TMP_DIR"/*.webm "$TMP_DIR"/*.mkv "$TMP_DIR"/*.mp3 "$TMP_DIR"/*.m4a; do
             [ -f "$MEDIA_FILE" ] || continue
             
             BASENAME=$(basename "$MEDIA_FILE")
-            FILENAME_NO_EXT="${BASENAME%.*}"
-            SAFE_NAME=$(sanitize_name "$FILENAME_NO_EXT")
+            SAFE_NAME=$(sanitize_name "${BASENAME%.*}")
             EXT="${BASENAME##*.}"
-            
             FILE_SIZE=$(stat -c%s "$MEDIA_FILE" 2>/dev/null || echo 0)
-            MAX_SIZE=$(( 2048 * 1024 * 1024 ))
-            if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
-              echo "  ⚠️ File too large — skipping"; continue
-            fi
             
-            FILE_SIZE=$(stat -c%s "$MEDIA_FILE" 2>/dev/null || echo 0)
-            MAX_SIZE=$(( 2048 * 1024 * 1024 ))
-            if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
-              echo "  ⚠️ File too large — skipping"; continue
-            fi
+            echo "  📦 ${SAFE_NAME}.${EXT} — $(( FILE_SIZE / 1024 / 1024 ))MB"
             
-            SPLIT_THRESHOLD_MB=45
-            SPLIT_THRESHOLD_BYTES=$(( SPLIT_THRESHOLD_MB * 1024 * 1024 ))
-            
-            if [ "$FILE_SIZE" -gt "$SPLIT_THRESHOLD_BYTES" ]; then
-              echo "  📦 File is $(( FILE_SIZE / 1024 / 1024 ))MB — splitting into ${SPLIT_THRESHOLD_MB}MB parts..."
-              ZIP_BASE="${CREATOR_DIR}/${SAFE_NAME}"
-              cp "$MEDIA_FILE" "$(dirname "$MEDIA_FILE")/${SAFE_NAME}.${EXT}"
-              cd "$(dirname "$MEDIA_FILE")" && zip -j -s ${SPLIT_THRESHOLD_MB}m "${ZIP_BASE}.zip" "${SAFE_NAME}.${EXT}" > /dev/null 2>&1
-              echo "  ✅ Split: ${SAFE_NAME}.zip + .z01, .z02..."
-              mkdir -p "${BACKUP_DIR}/${CREATOR_SLUG}"
-              cp "${ZIP_BASE}.zip"* "${BACKUP_DIR}/${CREATOR_SLUG}/" 2>/dev/null || true
+            # ═══ SIZE CHECK ═══
+            if [ "$FILE_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
+              if [ "$IS_PREMIUM" = "true" ]; then
+                # ═══ PREMIUM: Split with WinRAR ═══
+                echo "  ⭐ Premium user — splitting with RAR..."
+                
+                SPLIT_DIR="/tmp/rar_split_$$"
+                mkdir -p "$SPLIT_DIR"
+                
+                # Copy file to split directory
+                cp "$MEDIA_FILE" "${SPLIT_DIR}/${SAFE_NAME}.${EXT}"
+                
+                # Create RAR split volumes (45MB each)
+                cd "$SPLIT_DIR"
+                rar a -v${TARGET_SIZE_MB}m -ep1 -m0 -idq "${SAFE_NAME}.part.rar" "${SAFE_NAME}.${EXT}"
+                rm -f "${SAFE_NAME}.${EXT}"  # Remove original, keep only parts
+                cd - > /dev/null
+                
+                # Count parts
+                TOTAL_PARTS=$(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar 2>/dev/null | wc -l)
+                
+                if [ "$TOTAL_PARTS" -gt "$MAX_PARTS" ]; then
+                  echo "  ⚠️ Too many parts (${TOTAL_PARTS}) — rejecting"
+                  if [ -n "$CHAT_ID" ]; then
+                    notify_oversized "${SAFE_NAME}.${EXT}" "$FILE_SIZE" "$YT_URL"
+                  fi
+                  rm -rf "$SPLIT_DIR"
+                  continue
+                fi
+                
+                echo "  📦 Split into ${TOTAL_PARTS} RAR parts"
+                
+                # Upload all parts as documents
+                PART_NUM=0
+                FIRST_MESSAGE_ID=0
+                FIRST_FILE_ID=""
+                
+                # Sort parts alphabetically to ensure correct order
+                for PART_FILE in $(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar | sort); do
+                  [ -f "$PART_FILE" ] || continue
+                  PART_NUM=$((PART_NUM + 1))
+                  PART_NAME=$(basename "$PART_FILE")
+                  
+                  echo "  📤 Uploading part ${PART_NUM}/${TOTAL_PARTS}: ${PART_NAME}"
+                  
+                  UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendDocument" \
+                    -F "chat_id=${CHANNEL_ID}" \
+                    -F "document=@${PART_FILE}" \
+                    -F "caption=")
+                  
+                  MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
+                  FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.document.file_id // ""')
+                  
+                  if [ "$PART_NUM" -eq 1 ]; then
+                    FIRST_MESSAGE_ID=$MESSAGE_ID
+                    FIRST_FILE_ID=$FILE_ID
+                  fi
+                  
+                  if [ "$MESSAGE_ID" != "0" ]; then
+                    echo "    ✅ Part ${PART_NUM} uploaded (msg_id: ${MESSAGE_ID})"
+                  else
+                    echo "    ❌ Part ${PART_NUM} upload failed"
+                  fi
+                  sleep 2
+                done
+                
+                # Notify bot to cache (using first part's message_id and file_id)
+                if [ -n "$CHAT_ID" ] && [ -n "$FIRST_FILE_ID" ] && [ "$FIRST_MESSAGE_ID" != "0" ]; then
+                  notify_cache "youtube" "$YT_URL" "$QUALITY" "$FIRST_FILE_ID" "${CHANNEL_ID}" "$FIRST_MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "1" "$TOTAL_PARTS"
+                fi
+                
+                # Send multipart info to user
+                if [ -n "$CHAT_ID" ]; then
+                  notify_multipart_info "${SAFE_NAME}.${EXT}" "$TOTAL_PARTS" "$YT_URL"
+                fi
+                
+                rm -rf "$SPLIT_DIR"
+                
+              else
+                # ═══ FREE: Reject ═══
+                echo "  ⚠️ Free user — >45MB rejected"
+                if [ -n "$CHAT_ID" ]; then
+                  notify_oversized "${SAFE_NAME}.${EXT}" "$FILE_SIZE" "$YT_URL"
+                fi
+              fi
             else
-              echo "  📦 File is $(( FILE_SIZE / 1024 / 1024 ))MB — direct save (no split needed)"
-              cp "$MEDIA_FILE" "${CREATOR_DIR}/${SAFE_NAME}.${EXT}"
-              mkdir -p "${BACKUP_DIR}/${CREATOR_SLUG}"
-              cp "$MEDIA_FILE" "${BACKUP_DIR}/${CREATOR_SLUG}/${SAFE_NAME}.${EXT}"
+              # ═══ ≤45MB: Direct upload ═══
+              if [ -n "$CHANNEL_ID" ]; then
+                if [[ "$EXT" == "mp3" ]] || [[ "$QUALITY" == "audio" ]]; then
+                  UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendAudio" \
+                    -F "chat_id=${CHANNEL_ID}" -F "audio=@${MEDIA_FILE}" -F "caption=")
+                  FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.audio.file_id // ""')
+                else
+                  UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendVideo" \
+                    -F "chat_id=${CHANNEL_ID}" -F "video=@${MEDIA_FILE}" -F "caption=")
+                  FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.video.file_id // ""')
+                fi
+                
+                MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
+                
+                if [ -n "$FILE_ID" ] && [ "$MESSAGE_ID" != "0" ]; then
+                  echo "  ✅ Uploaded (msg_id: $MESSAGE_ID)"
+                  if [ -n "$CHAT_ID" ]; then
+                    notify_cache "youtube" "$YT_URL" "$QUALITY" "$FILE_ID" "${CHANNEL_ID}" "$MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "0" "1"
+                  fi
+                else
+                  echo "  ❌ Upload failed: $UPLOAD_RESPONSE"
+                fi
+                sleep 2
+              fi
             fi
-            echo "  📦 Saved: youtube/${CREATOR_SLUG}/${SAFE_NAME}.${EXT}"
-            VIDEO_COUNT=$((VIDEO_COUNT + 1))
-            
-            THUMB_FILE=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
-            if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
-              cp "$THUMB_FILE" "${CREATOR_DIR}/${SAFE_NAME}.jpg" 2>/dev/null
-              cp "$THUMB_FILE" "${BACKUP_DIR}/${CREATOR_SLUG}/${SAFE_NAME}.jpg" 2>/dev/null
-            fi
-            
-            CACHE_ENTRY=$(jq -n --arg path "youtube/${CREATOR_SLUG}/${SAFE_NAME}.${EXT}" \
-              --arg creator "$CREATOR" --arg title "$TITLE" --arg thumbnail "$THUMBNAIL_URL" \
-              --argjson duration "${DURATION:-0}" --argjson views "${VIEW_COUNT:-0}" \
-              '{path: $path, creator: $creator, title: $title, thumbnail: $thumbnail, duration: $duration, views: $views, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
-            jq --arg id "$VIDEO_ID" --argjson entry "$CACHE_ENTRY" '. + {($id): $entry}' "$CACHE_INDEX" > /tmp/cache_tmp.json
-            mv /tmp/cache_tmp.json "$CACHE_INDEX"
-            echo "  💾 Cached: $VIDEO_ID"
-            
-            printf '{\n  "title": "%s",\n  "creator": "%s",\n  "duration": %s,\n  "views": %s,\n  "likes": %s,\n  "thumbnail_url": "%s",\n  "video_url": "%s"\n}\n' \
-              "$TITLE" "$CREATOR" "${DURATION:-0}" "${VIEW_COUNT:-0}" "${LIKE_COUNT:-0}" \
-              "$THUMBNAIL_URL" "$YT_URL" \
-              > "${CREATOR_DIR}/${SAFE_NAME}_info.json"
-            echo "  📋 Saved video info: ${SAFE_NAME}_info.json"
           done
-          
-          # Subtitles
-          if [ "$DOWNLOAD_SUBS" = "true" ]; then
-            echo "📝 Downloading subtitles..."
-            SUB_DIR="${CREATOR_DIR}/subtitles"
-            mkdir -p "$SUB_DIR"
-            yt-dlp --proxy "socks5://127.0.0.1:1080" --write-sub --sub-langs "fa,en" \
-              --sub-format "vtt/srt/best" --convert-subs vtt --skip-download \
-              --no-playlist --output "${SUB_DIR}/%(title)s" "$YT_URL" 2>/dev/null || true
-            SUB_COUNT=$(find "$SUB_DIR" -type f 2>/dev/null | wc -l)
-            if [ "$SUB_COUNT" -gt 0 ]; then
-              (cd "$SUB_DIR" && zip -j "${CREATOR_DIR}/subtitles.zip" ./* 2>/dev/null) || true
-              echo "  ✅ Subtitles saved: subtitles.zip"
-            fi
-            rm -rf "$SUB_DIR"
-          fi
-          
-          VIDEO_LIST=$(ls "${CREATOR_DIR}"/*.mp4 "${CREATOR_DIR}"/*.webm "${CREATOR_DIR}"/*.mkv "${CREATOR_DIR}"/*.mp3 2>/dev/null | while read f; do
-            bn=$(basename "$f"); echo "  🎬 ${bn}"
-          done)
-          
-          printf '# %s\n\n**YouTube:** [%s](%s)\n\n| Views | Likes |\n|-------|-------|\n| %s | %s |\n\n## Videos\n\n%s\n\n*Downloaded via [khashayar.one](https://khashayar.one)*\n' \
-            "$CREATOR" "$CREATOR" "https://www.youtube.com/channel/$(echo "$INFO_JSON" | jq -r '.channel_id // ""')" \
-            "$(format_number $VIEW_COUNT)" "$(format_number $LIKE_COUNT)" \
-            "$(echo "$VIDEO_LIST" | sed 's/^/  /')" \
-            > "${CREATOR_DIR}/README.md"
-          echo "  📝 Updated README.md"
           
           rm -rf "$TMP_DIR"
           
           echo "CREATOR=${CREATOR}" >> $GITHUB_ENV
-          echo "CREATOR_SLUG=${CREATOR_SLUG}" >> $GITHUB_ENV
           echo "TRACK_TITLE=${TITLE}" >> $GITHUB_ENV
-          echo "VIDEO_COUNT=${VIDEO_COUNT}" >> $GITHUB_ENV
-          echo "VIDEO_ID=${VIDEO_ID}" >> $GITHUB_ENV
           echo "DURATION=${DURATION}" >> $GITHUB_ENV
           echo "THUMBNAIL_URL=${THUMBNAIL_URL}" >> $GITHUB_ENV
           echo "VIEW_COUNT=${VIEW_COUNT}" >> $GITHUB_ENV
-          echo "✅ Done: ${VIDEO_COUNT} video(s) from this URL"
           
           done
           
-          echo "✅ All URLs processed: ${TOTAL_URLS} total"
+          echo "✅ All URLs processed: ${TOTAL_URLS}"
 
-      # ── Step 7: Commit & Push ─────────────────────────
-      - name: "📤 Commit to Repository"
-        if: env.CACHE_HIT != 'true'
-        env:
-          CREATOR: ${{ env.CREATOR }}
-          TRACK_TITLE: ${{ env.TRACK_TITLE }}
-          REPO_DIR: ${{ env.REPO_DIR }}
-          BRANCH: ${{ github.ref_name }}
-        run: |
-          cd "$REPO_DIR"
-          git add youtube/
-          if git diff --staged --quiet; then
-            echo "✅ No changes"
-          else
-            CREATOR_NAME="${CREATOR:-Unknown Creator}"
-            TRACK_NAME="${TRACK_TITLE:-Untitled}"
-            git commit -m "feat(youtube): add ${CREATOR_NAME} — ${TRACK_NAME}"
-            git pull --rebase origin ${BRANCH} || true
-            git push origin ${BRANCH}
-            echo "✅ Pushed"
-          fi
-
-      # ── Step 8: Stop WARP ─────────────────────────────
+      # ── Step 7: Stop WARP ─────────────────────────────
       - name: "🛑 Stop WARP"
         if: always()
         run: |
           docker stop warp 2>/dev/null || true
           docker rm warp 2>/dev/null || true
 
-      # ═══════════════════════════════════════════════════
-      # Step 9: Send Combined Message (Video Info + Channel Link + Back Button)
-      # ═══════════════════════════════════════════════════
-      - name: "📬 Send Complete Result to User"
+      # ── Step 8: Send Result to User ───────────────────
+      - name: "📬 Send Complete Result"
         if: github.event.inputs.chat_id != ''
         env:
           BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
@@ -527,58 +473,35 @@ jobs:
           DURATION: ${{ env.DURATION }}
           VIEW_COUNT: ${{ env.VIEW_COUNT }}
           THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
-          QUALITY: ${{ env.QUALITY }}
           CHANNEL_ID: ${{ github.event.inputs.channel_id }}
           CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
-          CACHE_HIT: ${{ env.CACHE_HIT }}
-          CACHED_CREATOR: ${{ env.CACHED_CREATOR }}
-          CACHED_TITLE: ${{ env.CACHED_TITLE }}
-          CACHED_THUMB: ${{ env.CACHED_THUMB }}
-          CACHED_DURATION: ${{ env.CACHED_DURATION }}
-          CACHED_VIEWS: ${{ env.CACHED_VIEWS }}
-          VIDEO_COUNT: ${{ env.VIDEO_COUNT }}
         run: |
           #!/bin/bash
-          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          BALE_API="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          CHAT_ID="${CHAT_ID}"
+          CREATOR_NAME="${CREATOR:-Unknown}"
+          TITLE_NAME="${TRACK_TITLE:-Untitled}"
+          THUMB_URL="${THUMBNAIL_URL:-}"
+          DURATION_VAL="${DURATION:-0}"
+          VIEW_VAL="${VIEW_COUNT:-0}"
           
-          # ── Determine which data to use (cache vs fresh) ──
-          if [ "$CACHE_HIT" = "true" ]; then
-            CREATOR_NAME="${CACHED_CREATOR:-Unknown}"
-            TITLE_NAME="${CACHED_TITLE:-Untitled}"
-            THUMB_URL="${CACHED_THUMB:-}"
-            DURATION_VAL="${CACHED_DURATION:-0}"
-            VIEW_VAL="${CACHED_VIEWS:-0}"
-            VIDEO_COUNT_VAL="1"
-            SPEED_TEXT="⚡ از حافظه کش ارسال شد | "
-          else
-            CREATOR_NAME="${CREATOR:-Unknown}"
-            TITLE_NAME="${TRACK_TITLE:-Untitled}"
-            THUMB_URL="${THUMBNAIL_URL:-}"
-            DURATION_VAL="${DURATION:-0}"
-            VIEW_VAL="${VIEW_COUNT:-0}"
-            VIDEO_COUNT_VAL="${VIDEO_COUNT:-1}"
-            SPEED_TEXT=""
-          fi
-          
-          # ── Format duration ──
+          # Format duration
           if [ "$DURATION_VAL" -gt 0 ] 2>/dev/null; then
-            DUR_MIN=$(( DURATION_VAL / 60 ))
-            DUR_REM=$(( DURATION_VAL % 60 ))
-            DUR_FMT="${DUR_MIN}:$(printf '%02d' $DUR_REM)"
+            DUR_FMT="$(( DURATION_VAL / 60 )):$(printf '%02d' $(( DURATION_VAL % 60 )))"
           else
             DUR_FMT="—"
           fi
           
-          # ── Format views ──
+          # Format views
           if [ "$VIEW_VAL" != "0" ] && [ "$VIEW_VAL" != "null" ] && [ "$VIEW_VAL" -gt 0 ] 2>/dev/null; then
-            if [ "$VIEW_VAL" -gt 1000000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000000" | bc)M"
-            elif [ "$VIEW_VAL" -gt 1000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL / 1000" | bc)K"
+            if [ "$VIEW_VAL" -gt 1000000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL/1000000" | bc)M"
+            elif [ "$VIEW_VAL" -gt 1000 ]; then VIEWS_FMT="$(echo "scale=1; $VIEW_VAL/1000" | bc)K"
             else VIEWS_FMT="$VIEW_VAL"; fi
           else
             VIEWS_FMT="—"
           fi
           
-          # ── Build channel link ──
+          # Channel link
           if [ -n "$CHANNEL_USERNAME" ]; then
             CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
           elif [ -n "$CHANNEL_ID" ]; then
@@ -587,123 +510,34 @@ jobs:
             CHANNEL_LINK="https://ble.ir"
           fi
           
-          # ── Build caption (combined: video info + completion notice) ──
           CAPTION="🎬 *${TITLE_NAME}*
-          
+
           👤 *سازنده:* ${CREATOR_NAME}
           ⏱ *مدت:* ${DUR_FMT}  |  👁 *بازدید:* ${VIEWS_FMT}
-          
-          ✅ *دانلود کامل شد!* ${SPEED_TEXT}🎬 *تعداد:* ${VIDEO_COUNT_VAL}
+
+          ✅ *دانلود کامل شد!*
           📁 فایل در کانال آرشیو شما ذخیره شد.
-          
+
           🔗 [مشاهده در YouTube](${YT_URLS})"
           
-          # ── Build keyboard with channel link + back button ──
-          KEYBOARD=$(jq -n \
-            --arg channel_url "$CHANNEL_LINK" \
-            '{
-              inline_keyboard: [
-                [{text: "📂 دریافت فایل از کانال آرشیو", url: $channel_url}],
-                [{text: "🔙 بازگشت به منوی اصلی", callback_data: "back_to_main"}]
-              ]
-            }')
+          KEYBOARD='{"inline_keyboard":[[{"text":"📂 دریافت فایل از کانال آرشیو","url":"'"${CHANNEL_LINK}"'"}],[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
           
-          # Escape for JSON
-          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -R -s '.')
-          ESCAPED_KEYBOARD=$(echo "$KEYBOARD" | jq -c '.')
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -Rsc '.')
           
-          # ── Send as photo with caption (if thumbnail exists) ──
-          PHOTO_SENT=false
           if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
-            echo "🖼️ Sending photo with caption via JSON..."
-            PHOTO_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendPhoto" \
+            PHOTO_RESULT=$(curl -s -X POST "${BALE_API}/sendPhoto" \
               -H "Content-Type: application/json" \
-              -d "{
-                \"chat_id\": \"${CHAT_ID}\",
-                \"photo\": \"${THUMB_URL}\",
-                \"caption\": ${ESCAPED_CAPTION},
-                \"parse_mode\": \"Markdown\",
-                \"reply_markup\": ${ESCAPED_KEYBOARD}
-              }")
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"photo\":\"${THUMB_URL}\",\"caption\":${ESCAPED_CAPTION},\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}")
             
-            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
-              PHOTO_SENT=true
-              echo "  ✅ Photo sent successfully"
-            else
-              echo "  ⚠️ Photo failed, trying text fallback..."
+            if ! echo "$PHOTO_RESULT" | jq -e '.ok == true' > /dev/null 2>&1; then
+              curl -s -X POST "${BALE_API}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":${ESCAPED_CAPTION},\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}" > /dev/null 2>&1
             fi
-          fi
-          
-          # ── Fallback: send as text message via JSON ──
-          if [ "$PHOTO_SENT" = false ]; then
-            echo "📝 Sending as text message via JSON..."
-            TEXT_RESPONSE=$(curl -s -X POST "${BALE_API_URL}/sendMessage" \
-              -H "Content-Type: application/json" \
-              -d "{
-                \"chat_id\": \"${CHAT_ID}\",
-                \"text\": ${ESCAPED_CAPTION},
-                \"parse_mode\": \"Markdown\",
-                \"reply_markup\": ${ESCAPED_KEYBOARD}
-              }")
-            
-            if echo "$TEXT_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
-              echo "  ✅ Text sent successfully"
-            else
-              echo "  ❌ Text also failed: $TEXT_RESPONSE"
-            fi
-          fi
-          
-          echo "✅ Complete result sent to user"
-          
-      # ═══════════════════════════════════════════════════
-      # Step 10: Upload Video to Channel
-      # ═══════════════════════════════════════════════════
-      - name: "📤 Upload to User's Channel"
-        if: github.event.inputs.channel_id != ''
-        env:
-          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
-          BACKUP_DIR: ${{ env.BACKUP_DIR }}
-          QUALITY: ${{ env.QUALITY }}
-          CACHE_HIT: ${{ env.CACHE_HIT }}
-          CACHED_FILE: ${{ env.CACHED_FILE }}
-          REPO_DIR: ${{ env.REPO_DIR }}
-        run: |
-          #!/bin/bash
-          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
-          echo "📤 Uploading videos to Bale channel..."
-          
-          if [ "$CACHE_HIT" = "true" ]; then
-            FILE_PATH="${REPO_DIR}/${CACHED_FILE}"
-            FILENAME=$(basename "$FILE_PATH")
-            echo "  📄 Uploading from cache: $FILENAME"
-            if [[ "$QUALITY" == "audio" ]]; then
-              curl -s -X POST "${BALE_API_URL}/sendAudio" -F "chat_id=${CHANNEL_ID}" \
-                -F "audio=@${FILE_PATH}" -F "caption=🎬 ${FILENAME%.*} | YouTube" > /dev/null 2>&1
-            else
-              curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-                -F "video=@${FILE_PATH}" -F "caption=🎬 ${FILENAME%.*} | YouTube" > /dev/null 2>&1
-            fi
-            echo "    ✅ Uploaded"
           else
-            for CREATOR_FOLDER in "$BACKUP_DIR"/*/ ; do
-              [ -d "$CREATOR_FOLDER" ] || continue
-              CREATOR_NAME=$(basename "$CREATOR_FOLDER")
-              for FILE in "$CREATOR_FOLDER"/*; do
-                [ -f "$FILE" ] || continue
-                [[ "$FILE" == *.jpg ]] && continue
-                FILENAME=$(basename "$FILE")
-                echo "  📄 Uploading: $FILENAME"
-                if [[ "$FILENAME" == *.mp3 ]] || [[ "$QUALITY" == "audio" ]]; then
-                  curl -s -X POST "${BALE_API_URL}/sendAudio" -F "chat_id=${CHANNEL_ID}" \
-                    -F "audio=@${FILE}" -F "caption=🎬 ${CREATOR_NAME} — ${FILENAME%.*} | YouTube" > /dev/null 2>&1
-                else
-                  curl -s -X POST "${BALE_API_URL}/sendVideo" -F "chat_id=${CHANNEL_ID}" \
-                    -F "video=@${FILE}" -F "caption=🎬 ${CREATOR_NAME} — ${FILENAME%.*} | YouTube" > /dev/null 2>&1
-                fi
-                echo "    ✅ Uploaded"
-                sleep 3
-              done
-            done
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":${ESCAPED_CAPTION},\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}" > /dev/null 2>&1
           fi
-          echo "✅ All videos uploaded"
+          
+          echo "✅ Result sent to user"
