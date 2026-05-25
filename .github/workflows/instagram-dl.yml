@@ -338,7 +338,7 @@ jobs:
               if [ -n "$CHANNEL_ID" ]; then
                 echo "  📤 Uploading to channel..."
                 UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendVideo" \
-                  -F "chat_id=${CHANNEL_ID}" -F "video=@${MEDIA_FILE}" -F "caption=${CAPTION_TEXT}")
+                  -F "chat_id=${CHANNEL_ID}" -F "video=@${MEDIA_FILE}" -F "caption=")
 
                 FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.video.file_id // ""')
                 MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
