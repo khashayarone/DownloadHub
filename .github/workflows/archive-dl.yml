@@ -1,0 +1,580 @@
+# ============================================================
+# archive-dl.yml — Bale Internet Archive Downloader V1
+# Repository: github.com/khashayarone/DownloadHub
+# ============================================================
+# Features V1:
+#   ۱. Download books from Internet Archive (archive.org)
+#   ۲. Multiple formats: PDF, EPUB, TXT, DJVU
+#   ۳. Search by title/author (returns top 5 results)
+#   ۴. Direct download via yt-dlp
+#   ۵. Premium-aware: >45MB split into .partX.rar
+#   ۶. Free users: >45MB notification with back button
+#   ۷. Combined single message (thumbnail + caption + channel + back)
+#   ۸. Direct upload via sendDocument
+#   ۹. /cache notification with multipart support
+#   ۱۰. WinRAR split volumes for large books
+#   ۱۱. Compatible with Bale DownloadHub Bot v6
+# ============================================================
+
+name: "📚 Internet Archive Downloader"
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_id:
+        description: "📖 Internet Archive Identifier (e.g., ShahnamehFerdowsi)"
+        required: true
+        type: string
+      format:
+        description: "📁 Book Format"
+        required: false
+        type: choice
+        default: "pdf"
+        options:
+          - pdf
+          - epub
+          - txt
+          - djvu
+      quality:
+        description: "📹 Quality (720=best, 480=medium, audio=MP3) — for video items"
+        required: false
+        type: choice
+        default: "720"
+        options:
+          - "720"
+          - "480"
+          - audio
+      search_query:
+        description: "🔍 Search query (optional — returns top 5 results)"
+        required: false
+        type: string
+        default: ""
+      chat_id:
+        description: "🆔 User Chat ID for notification"
+        required: false
+        type: string
+        default: ""
+      channel_id:
+        description: "📢 Channel ID for archiving"
+        required: false
+        type: string
+        default: ""
+      channel_username:
+        description: "📢 Channel Username"
+        required: false
+        type: string
+        default: ""
+      is_premium:
+        description: "⭐ Premium user? (true/false)"
+        required: false
+        type: string
+        default: "false"
+
+env:
+  PROJECT_NAME: "Khashayar Downloader"
+  PROJECT_URL: "https://khashayar.one"
+  PLATFORM: "archive"
+  TARGET_SIZE_MB: 45
+  TARGET_SIZE_BYTES: 47185920
+  ADMIN_CHAT_ID: "241726352"
+  MAX_PARTS: 20
+
+jobs:
+  download:
+    name: "📚 Download & Upload"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      # ── Step 1: Checkout ──────────────────────────────
+      - name: "📥 Checkout Repository"
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # ── Step 2: Git Config ────────────────────────────
+      - name: "⚙️ Configure Git"
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # ── Step 3: Cloudflare WARP ───────────────────────
+      - name: "🌐 Setup Cloudflare WARP"
+        run: |
+          docker network create warp-net 2>/dev/null || true
+          docker run -d --name warp --restart=no --network warp-net \
+            -p 1080:1080 --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp:latest
+          sleep 15
+          for i in $(seq 1 5); do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then echo "✅ WARP active!"; break; else sleep 5; fi
+          done
+
+      # ── Step 4: Dependencies ───────────────────────────
+      - name: "📦 Install Dependencies"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-pip ffmpeg curl jq bc rar
+          pip3 install --upgrade yt-dlp --quiet
+
+      # ── Step 5: Search (if search_query provided) ─────
+      - name: "🔍 Search Internet Archive"
+        id: search
+        if: github.event.inputs.search_query != ''
+        env:
+          SEARCH_QUERY: ${{ github.event.inputs.search_query }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        run: |
+          #!/bin/bash
+          QUERY="${SEARCH_QUERY}"
+          CHAT_ID="${CHAT_ID}"
+          BALE_API="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          
+          echo "🔍 Searching for: ${QUERY}"
+          
+          # Search Internet Archive API
+          SEARCH_URL="https://archive.org/advancedsearch.php?q=$(echo "$QUERY" | jq -Rrc '@uri')+AND+mediatype:(texts)&fl[]=identifier,title,creator,year,format,avg_rating&sort[]=downloads+desc&rows=5&output=json"
+          
+          SEARCH_RESULT=$(curl -s --max-time 15 "${SEARCH_URL}" || echo '{"response":{"docs":[]}}')
+          
+          # Parse results
+          NUM_RESULTS=$(echo "$SEARCH_RESULT" | jq -r '.response.docs | length // 0')
+          
+          if [ "$NUM_RESULTS" -eq 0 ]; then
+            # No results
+            NO_RESULT_TEXT="❌ *نتیجه‌ای یافت نشد!*\n\n🔍 عبارت جستجو: *${QUERY}*\n\nلطفاً عبارت دیگری را امتحان کنید یا لینک مستقیم کتاب را بفرستید."
+            NO_RESULT_KB='{"inline_keyboard":[[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+            
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$NO_RESULT_TEXT" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${NO_RESULT_KB}}" > /dev/null 2>&1
+            
+            echo "SEARCH_RESULTS=0" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          # Build results message
+          RESULT_TEXT="📚 *نتایج جستجو برای «${QUERY}»:*\n\n"
+          
+          declare -a IDS=()
+          declare -a TITLES=()
+          declare -a CREATORS=()
+          declare -a FORMATS=()
+          
+          for i in $(seq 0 $((NUM_RESULTS - 1))); do
+            ID=$(echo "$SEARCH_RESULT" | jq -r ".response.docs[$i].identifier // \"\"")
+            TITLE=$(echo "$SEARCH_RESULT" | jq -r ".response.docs[$i].title // \"بدون عنوان\"")
+            CREATOR=$(echo "$SEARCH_RESULT" | jq -r ".response.docs[$i].creator // \"ناشناس\"")
+            YEAR=$(echo "$SEARCH_RESULT" | jq -r ".response.docs[$i].year // \"\"")
+            
+            # Truncate long titles
+            if [ ${#TITLE} -gt 50 ]; then
+              TITLE="${TITLE:0:47}..."
+            fi
+            
+            NUM=$((i + 1))
+            RESULT_TEXT+="${NUM}\\. *${TITLE}*\n"
+            RESULT_TEXT+="   👤 ${CREATOR}"
+            [ -n "$YEAR" ] && RESULT_TEXT+=" | 📅 ${YEAR}"
+            RESULT_TEXT+="\n\n"
+            
+            IDS+=("$ID")
+            TITLES+=("$TITLE")
+            CREATORS+=("$CREATOR")
+          done
+          
+          RESULT_TEXT+="👇 برای انتخاب، شماره کتاب را به صورت /select بفرستید."
+          
+          # Build keyboard with numbered buttons
+          KEYBOARD='{"inline_keyboard":['
+          for i in $(seq 0 $((NUM_RESULTS - 1))); do
+            NUM=$((i + 1))
+            KEYBOARD+="[{\"text\":\"${NUM}\",\"callback_data\":\"archive_select_${i}\"}]"
+            [ $i -lt $((NUM_RESULTS - 1)) ] && KEYBOARD+=","
+          done
+          KEYBOARD+=',[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+          
+          # Send results to user
+          curl -s -X POST "${BALE_API}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$RESULT_TEXT" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}" > /dev/null 2>&1
+          
+          # Save IDs to env for later use
+          echo "SEARCH_RESULTS=${NUM_RESULTS}" >> $GITHUB_ENV
+          for i in $(seq 0 $((NUM_RESULTS - 1))); do
+            echo "RESULT_${i}_ID=${IDS[$i]}" >> $GITHUB_ENV
+            echo "RESULT_${i}_TITLE=${TITLES[$i]}" >> $GITHUB_ENV
+            echo "RESULT_${i}_CREATOR=${CREATORS[$i]}" >> $GITHUB_ENV
+          done
+          
+          echo "✅ Search complete — ${NUM_RESULTS} results sent"
+
+      # ── Step 6: Setup Parameters ──────────────────────
+      - name: "🔧 Setup Download Parameters"
+        id: setup
+        env:
+          ARCHIVE_ID: ${{ github.event.inputs.archive_id }}
+          BOOK_FORMAT: ${{ github.event.inputs.format }}
+          IS_PREMIUM: ${{ github.event.inputs.is_premium }}
+        run: |
+          ARCHIVE_ID="${ARCHIVE_ID}"
+          FORMAT="${BOOK_FORMAT}"
+          IS_PREMIUM="${IS_PREMIUM}"
+          
+          echo "════════════════════════════════════════"
+          echo "  $PROJECT_NAME | $PROJECT_URL"
+          echo "════════════════════════════════════════"
+          echo "📖 Archive ID: ${ARCHIVE_ID}"
+          echo "📁 Format: ${FORMAT}"
+          echo "⭐ Premium: ${IS_PREMIUM}"
+          
+          echo "ARCHIVE_ID=${ARCHIVE_ID}" >> $GITHUB_ENV
+          echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
+          echo "IS_PREMIUM=${IS_PREMIUM}" >> $GITHUB_ENV
+          echo "TMP_DIR=/tmp/archive_dl_$$" >> $GITHUB_ENV
+          
+          mkdir -p /tmp/archive_dl_$$
+          echo "✅ Setup complete"
+
+      # ── Step 7: Download & Process ────────────────────
+      - name: "📚 Download & Process Book"
+        id: download
+        env:
+          ARCHIVE_ID: ${{ env.ARCHIVE_ID }}
+          FORMAT: ${{ env.FORMAT }}
+          IS_PREMIUM: ${{ env.IS_PREMIUM }}
+          TMP_DIR: ${{ env.TMP_DIR }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        run: |
+          #!/bin/bash
+          shopt -s nullglob
+          set -e
+          
+          TARGET_SIZE_BYTES=$(( 45 * 1024 * 1024 ))
+          BALE_API="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          ADMIN_ID="${ADMIN_CHAT_ID}"
+          MAX_PARTS="${MAX_PARTS}"
+          ARCHIVE_ID="${ARCHIVE_ID}"
+          FORMAT="${FORMAT}"
+          IS_PREMIUM="${IS_PREMIUM}"
+          TMP_DIR="${TMP_DIR}"
+          CHAT_ID="${CHAT_ID}"
+          CHANNEL_ID="${CHANNEL_ID}"
+          
+          if [ -z "$ARCHIVE_ID" ]; then
+            echo "⚠️ No archive ID provided — skipping download"
+            exit 0
+          fi
+          
+          ARCHIVE_URL="https://archive.org/details/${ARCHIVE_ID}"
+          
+          sanitize_name() {
+            local name="$1"
+            name=$(echo "$name" | sed 's/[()（）]/_/g' | sed 's/[][{}\/\\<>|:;'"'"'"]/_/g')
+            name=$(echo "$name" | tr '[:space:]｜　' '-' | tr -c 'a-zA-Z0-9_-' '-' | tr -s '-' | sed 's/^-//;s/-$//')
+            [ -z "$name" ] && name="unknown"
+            echo "$name"
+          }
+          
+          notify_oversized() {
+            local fname="$1" fsize="$2"
+            local fsize_mb=$(( fsize / 1024 / 1024 ))
+            local caption="⚠️ *کتاب بیشتر از ۴۵ مگابایت است!*\n\n📁 *نام:* ${fname}\n📦 *حجم:* ${fsize_mb}MB\n\n❌ امکان دانلود در نسخه رایگان وجود ندارد.\n⭐ با خرید اشتراک پریمیوم محدودیت حجم برداشته میشود."
+            local kb='{"inline_keyboard":[[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$caption" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${kb}}" > /dev/null 2>&1
+          }
+          
+          notify_multipart_info() {
+            local fname="$1" total_parts="$2"
+            local caption="📦 *کتاب به ${total_parts} پارت ۴۵MB تقسیم شد.*\n\n📁 *نام:* ${fname}\n📥 همه پارت‌ها را دانلود کنید، سپس *پارت ۱* را Extract کنید."
+            local kb='{"inline_keyboard":[[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$caption" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${kb}}" > /dev/null 2>&1
+          }
+          
+          notify_cache() {
+            local platform="$1" url="$2" quality="$3" file_id="$4" channel_id="$5" message_id="$6" file_size="$7" file_name="$8" is_multipart="$9" total_parts="${10}"
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${ADMIN_ID}\",\"text\":\"/cache ${platform} ${url} ${quality} ${file_id} ${channel_id} ${message_id} ${file_size} ${file_name} ${is_multipart} ${total_parts}\"}" > /dev/null 2>&1
+          }
+          
+          echo "📥 Fetching metadata for: ${ARCHIVE_URL}"
+          
+          # Get item metadata
+          METADATA_URL="https://archive.org/metadata/${ARCHIVE_ID}"
+          METADATA=$(curl -s --max-time 15 "${METADATA_URL}" || echo "{}")
+          
+          BOOK_TITLE=$(echo "$METADATA" | jq -r '.metadata.title // "Unknown Title"')
+          BOOK_CREATOR=$(echo "$METADATA" | jq -r '.metadata.creator // "Unknown Author"')
+          BOOK_YEAR=$(echo "$METADATA" | jq -r '.metadata.year // ""')
+          
+          echo "  📖 Title: ${BOOK_TITLE}"
+          echo "  👤 Author: ${BOOK_CREATOR}"
+          [ -n "$BOOK_YEAR" ] && echo "  📅 Year: ${BOOK_YEAR}"
+          
+          # Download with yt-dlp
+          echo "⬇️ Downloading: ${BOOK_TITLE} (${FORMAT})"
+          
+          # Map format to yt-dlp format selector
+          case "${FORMAT}" in
+            pdf)  YTDL_FORMAT="pdf" ;;
+            epub) YTDL_FORMAT="epub" ;;
+            txt)  YTDL_FORMAT="txt" ;;
+            djvu) YTDL_FORMAT="djvu" ;;
+            *)    YTDL_FORMAT="pdf" ;;
+          esac
+          
+          DOWNLOAD_SUCCESS=false
+          
+          # Try with WARP proxy first
+          if yt-dlp --proxy "socks5://127.0.0.1:1080" \
+            --format "${YTDL_FORMAT}" \
+            --no-cache-dir \
+            --output "${TMP_DIR}/%(title)s.%(ext)s" \
+            --no-part \
+            --retries 3 \
+            --no-check-certificates \
+            --progress --newline \
+            "${ARCHIVE_URL}" 2>&1 | grep -q "100%"; then
+            DOWNLOAD_SUCCESS=true
+            echo "  ✅ Downloaded via WARP"
+          else
+            # Retry without proxy
+            echo "  🔄 Retrying without proxy..."
+            if yt-dlp --format "${YTDL_FORMAT}" \
+              --no-cache-dir \
+              --output "${TMP_DIR}/%(title)s.%(ext)s" \
+              --no-part \
+              --retries 3 \
+              --progress --newline \
+              "${ARCHIVE_URL}" 2>&1 | grep -q "100%"; then
+              DOWNLOAD_SUCCESS=true
+              echo "  ✅ Downloaded via direct"
+            fi
+          fi
+          
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "  🚫 Download failed"
+            
+            # Notify user
+            if [ -n "$CHAT_ID" ]; then
+              FAIL_TEXT="❌ *دانلود ناموفق!*\n\n📖 *${BOOK_TITLE}*\n👤 ${BOOK_CREATOR}\n\nلطفاً دوباره تلاش کنید یا کتاب دیگری انتخاب کنید."
+              FAIL_KB='{"inline_keyboard":[[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+              curl -s -X POST "${BALE_API}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$FAIL_TEXT" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${FAIL_KB}}" > /dev/null 2>&1
+            fi
+            rm -rf "$TMP_DIR"
+            exit 0
+          fi
+          
+          # Process downloaded files
+          for BOOK_FILE in "$TMP_DIR"/*.pdf "$TMP_DIR"/*.epub "$TMP_DIR"/*.txt "$TMP_DIR"/*.djvu "$TMP_DIR"/*.jpg "$TMP_DIR"/*.png; do
+            [ -f "$BOOK_FILE" ] || continue
+            
+            # Skip cover images (small files that yt-dlp sometimes downloads)
+            BASENAME=$(basename "$BOOK_FILE")
+            EXT="${BASENAME##*.}"
+            FILE_SIZE=$(stat -c%s "$BOOK_FILE" 2>/dev/null || echo 0)
+            
+            # Skip files smaller than 10KB (likely thumbnails)
+            if [ "$FILE_SIZE" -lt 10240 ] && [[ "$EXT" =~ ^(jpg|png|gif)$ ]]; then
+              echo "  ⏭️ Skipping thumbnail: ${BASENAME}"
+              continue
+            fi
+            
+            SAFE_NAME=$(sanitize_name "${BASENAME%.*}")
+            
+            echo "  📦 ${BASENAME} — $(( FILE_SIZE / 1024 / 1024 ))MB"
+            
+            # ═══ SIZE CHECK ═══
+            if [ "$FILE_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
+              if [ "$IS_PREMIUM" = "true" ]; then
+                # ═══ PREMIUM: Split with WinRAR ═══
+                echo "  ⭐ Premium user — splitting with RAR..."
+                
+                SPLIT_DIR="/tmp/rar_split_$$"
+                mkdir -p "$SPLIT_DIR"
+                cp "$BOOK_FILE" "${SPLIT_DIR}/${SAFE_NAME}.${EXT}"
+                
+                cd "$SPLIT_DIR"
+                rar a -v${TARGET_SIZE_MB}m -ep1 -m0 -idq "${SAFE_NAME}.part.rar" "${SAFE_NAME}.${EXT}"
+                rm -f "${SAFE_NAME}.${EXT}"
+                cd - > /dev/null
+                
+                TOTAL_PARTS=$(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar 2>/dev/null | wc -l)
+                
+                if [ "$TOTAL_PARTS" -gt "$MAX_PARTS" ]; then
+                  echo "  ⚠️ Too many parts — rejecting"
+                  if [ -n "$CHAT_ID" ]; then
+                    notify_oversized "${BASENAME}" "$FILE_SIZE"
+                  fi
+                  rm -rf "$SPLIT_DIR"
+                  continue
+                fi
+                
+                echo "  📦 Split into ${TOTAL_PARTS} RAR parts"
+                
+                PART_NUM=0
+                FIRST_MESSAGE_ID=0
+                FIRST_FILE_ID=""
+                
+                for PART_FILE in $(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar | sort); do
+                  [ -f "$PART_FILE" ] || continue
+                  PART_NUM=$((PART_NUM + 1))
+                  
+                  echo "  📤 Uploading part ${PART_NUM}/${TOTAL_PARTS}"
+                  
+                  UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendDocument" \
+                    -F "chat_id=${CHANNEL_ID}" \
+                    -F "document=@${PART_FILE}" \
+                    -F "caption=")
+                  
+                  MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
+                  FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.document.file_id // ""')
+                  
+                  if [ "$PART_NUM" -eq 1 ]; then
+                    FIRST_MESSAGE_ID=$MESSAGE_ID
+                    FIRST_FILE_ID=$FILE_ID
+                  fi
+                  
+                  [ "$MESSAGE_ID" != "0" ] && echo "    ✅ Part ${PART_NUM} uploaded" || echo "    ❌ Part ${PART_NUM} failed"
+                  sleep 2
+                done
+                
+                if [ -n "$CHAT_ID" ] && [ -n "$FIRST_FILE_ID" ] && [ "$FIRST_MESSAGE_ID" != "0" ]; then
+                  notify_cache "archive" "$ARCHIVE_URL" "$FORMAT" "$FIRST_FILE_ID" "${CHANNEL_ID}" "$FIRST_MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "1" "$TOTAL_PARTS"
+                fi
+                
+                if [ -n "$CHAT_ID" ]; then
+                  notify_multipart_info "${BASENAME}" "$TOTAL_PARTS"
+                fi
+                
+                rm -rf "$SPLIT_DIR"
+              else
+                # ═══ FREE: Reject ═══
+                echo "  ⚠️ Free user — >45MB rejected"
+                if [ -n "$CHAT_ID" ]; then
+                  notify_oversized "${BASENAME}" "$FILE_SIZE"
+                fi
+              fi
+            else
+              # ═══ ≤45MB: Direct upload ═══
+              if [ -n "$CHANNEL_ID" ]; then
+                echo "  📤 Uploading to channel..."
+                UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendDocument" \
+                  -F "chat_id=${CHANNEL_ID}" \
+                  -F "document=@${BOOK_FILE}" \
+                  -F "caption=")
+                
+                FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.document.file_id // ""')
+                MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
+                
+                if [ -n "$FILE_ID" ] && [ "$MESSAGE_ID" != "0" ]; then
+                  echo "  ✅ Uploaded (msg_id: $MESSAGE_ID)"
+                  if [ -n "$CHAT_ID" ]; then
+                    notify_cache "archive" "$ARCHIVE_URL" "$FORMAT" "$FILE_ID" "${CHANNEL_ID}" "$MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "0" "1"
+                  fi
+                else
+                  echo "  ❌ Upload failed"
+                fi
+                sleep 2
+              fi
+            fi
+          done
+          
+          # Save book info for notification
+          echo "BOOK_TITLE=${BOOK_TITLE}" >> $GITHUB_ENV
+          echo "BOOK_CREATOR=${BOOK_CREATOR}" >> $GITHUB_ENV
+          echo "BOOK_YEAR=${BOOK_YEAR}" >> $GITHUB_ENV
+          
+          rm -rf "$TMP_DIR"
+          echo "✅ Download complete"
+
+      # ── Step 8: Stop WARP ─────────────────────────────
+      - name: "🛑 Stop WARP"
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
+
+      # ── Step 9: Send Result to User ───────────────────
+      - name: "📬 Send Complete Result"
+        if: github.event.inputs.chat_id != '' && github.event.inputs.archive_id != ''
+        env:
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          ARCHIVE_ID: ${{ env.ARCHIVE_ID }}
+          BOOK_TITLE: ${{ env.BOOK_TITLE }}
+          BOOK_CREATOR: ${{ env.BOOK_CREATOR }}
+          BOOK_YEAR: ${{ env.BOOK_YEAR }}
+          FORMAT: ${{ env.FORMAT }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
+        run: |
+          #!/bin/bash
+          BALE_API="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          CHAT_ID="${CHAT_ID}"
+          ARCHIVE_ID="${ARCHIVE_ID}"
+          BOOK_TITLE="${BOOK_TITLE:-Unknown Title}"
+          BOOK_CREATOR="${BOOK_CREATOR:-Unknown Author}"
+          BOOK_YEAR="${BOOK_YEAR:-}"
+          FORMAT="${FORMAT:-pdf}"
+          
+          ARCHIVE_URL="https://archive.org/details/${ARCHIVE_ID}"
+          
+          # Build channel link
+          if [ -n "$CHANNEL_USERNAME" ]; then
+            CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
+          elif [ -n "$CHANNEL_ID" ]; then
+            CHANNEL_LINK="https://ble.ir/im/p/${CHANNEL_ID}"
+          else
+            CHANNEL_LINK="https://ble.ir"
+          fi
+          
+          # Format display
+          FORMAT_UPPER=$(echo "$FORMAT" | tr '[:lower:]' '[:upper:]')
+          
+          CAPTION="📚 *${BOOK_TITLE}*
+
+          👤 *نویسنده:* ${BOOK_CREATOR}"
+          
+          [ -n "$BOOK_YEAR" ] && CAPTION+="
+          📅 *سال:* ${BOOK_YEAR}"
+          
+          CAPTION+="
+
+          📁 *فرمت:* ${FORMAT_UPPER}
+
+          ✅ *دانلود کامل شد!*
+          📁 کتاب در کانال آرشیو شما ذخیره شد.
+
+          🔗 [مشاهده در Internet Archive](${ARCHIVE_URL})"
+          
+          KEYBOARD='{"inline_keyboard":[[{"text":"📂 دریافت کتاب از کانال آرشیو","url":"'"${CHANNEL_LINK}"'"}],[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+          
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -Rsc '.')
+          
+          curl -s -X POST "${BALE_API}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":${ESCAPED_CAPTION},\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}" > /dev/null 2>&1
+          
+          echo "✅ Result sent to user"
