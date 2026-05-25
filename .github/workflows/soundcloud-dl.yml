@@ -1,51 +1,38 @@
 # ============================================================
-# soundcloud-dl.yml — Bale SoundCloud Downloader V2
-# Repository: ghgithub.com/khashayarone/DownloadHub
+# soundcloud-dl.yml — Bale SoundCloud Downloader V3
+# Repository: github.com/khashayardev/DownloadHub
 # ============================================================
-# Features V2:
-#   ۱. Cache system — checks repo before downloading (instant skip)
-#   ۲. Full playlist & artist discography download
-#   ۳. Multiple output formats (mp3, m4a, opus, flac)
-#   ۴. Genre-based folder organization
-#   ۵. Lyrics extraction & storage (.lrc)
-#   ۶. Waveform & artwork download
-#   ۷. Rich artist info in artist_info.json (plays, likes, reposts)
-#   ۸. Smart README with tracklist, genre, stats
-#   ۹. Thumbnail as photo in Bale + formatted Persian caption
-#   ۱۰. Audio file sent as music player (sendAudio)
-#   ۱۱. Search SoundCloud by query (integrated via inputs)
-#   ۱۲. Dedicated folder per platform: soundcloud/artist-slug/
+# Features V3:
+#   ۱. Download tracks, playlists, artist discography
+#   ۲. Quality mapping: high→320kbps, medium→128kbps (MP3)
+#   ۳. Two-Layer Cache compatible (notifies bot via /cache)
+#   ۴. Premium-aware: >45MB split into .partX.rar
+#   ۵. Free users: >45MB notification with back button
+#   ۶. Combined single message (thumbnail + caption + channel + back)
+#   ۷. Direct upload via sendAudio
+#   ۸. /cache notification with multipart support
+#   ۹. WinRAR split volumes for large audio collections
+#   ۱۰. No repo storage — direct upload only
+#   ۱۱. Compatible with Bale DownloadHub Bot v7
 # ============================================================
 
-name: "🎵 SoundCloud Downloader"
+name: "🎧 SoundCloud Downloader V3"
 
 on:
   workflow_dispatch:
     inputs:
       soundcloud_urls:
-        description: "🔗 SoundCloud URL(s) — separate with space"
+        description: "🔗 SoundCloud URL(s)"
         required: true
         type: string
       quality:
-        description: "🎧 Audio Quality"
+        description: "🎧 Quality (high=320kbps, medium=128kbps)"
         required: false
         type: choice
-        default: "best"
+        default: "high"
         options:
-          - best
           - high
           - medium
-          - low
-      format_choice:
-        description: "🎵 Output Format"
-        required: false
-        type: choice
-        default: "mp3"
-        options:
-          - mp3
-          - m4a
-          - opus
-          - flac
       download_type:
         description: "📋 Download Type"
         required: false
@@ -56,22 +43,17 @@ on:
           - playlist
           - all_artist
       max_tracks:
-        description: "🔢 Max Tracks (for playlist/artist)"
+        description: "🔢 Max Tracks"
         required: false
         type: string
         default: "10"
-      extract_lyrics:
-        description: "📝 Extract Lyrics"
-        required: false
-        type: boolean
-        default: true
       chat_id:
-        description: "🆔 User Chat ID for notification"
+        description: "🆔 User Chat ID"
         required: false
         type: string
         default: ""
       channel_id:
-        description: "📢 Channel ID for archiving"
+        description: "📢 Channel ID"
         required: false
         type: string
         default: ""
@@ -80,47 +62,49 @@ on:
         required: false
         type: string
         default: ""
+      is_premium:
+        description: "⭐ Premium user?"
+        required: false
+        type: string
+        default: "false"
 
 env:
   PROJECT_NAME: "Khashayar Downloader"
   PROJECT_URL: "https://khashayar.one"
   PLATFORM: "soundcloud"
+  TARGET_SIZE_MB: 45
+  TARGET_SIZE_BYTES: 47185920
+  ADMIN_CHAT_ID: "241726352"
+  MAX_PARTS: 20
 
 jobs:
   download:
-    name: "🎵 Download & Store"
+    name: "🎧 Download & Upload"
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
       actions: read
 
     steps:
-      # ── Step 1: Checkout ──────────────────────────────
       - name: "📥 Checkout Repository"
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
-      # ── Step 2: Git Config ────────────────────────────
       - name: "⚙️ Configure Git"
         run: |
           git config --global http.postBuffer 524288000
           git config --global http.maxRequestBuffer 100M
           git config --global core.compression 0
-          git config --global pack.windowMemory 256m
-          git config --global pack.packSizeLimit 100m
-          git config --global pack.threads 1
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # ── Step 3: Cloudflare WARP ───────────────────────
       - name: "🌐 Setup Cloudflare WARP"
         run: |
           docker network create warp-net 2>/dev/null || true
-          docker run -d \
-            --name warp --restart=no --network warp-net \
+          docker run -d --name warp --restart=no --network warp-net \
             -p 1080:1080 --cap-add NET_ADMIN \
             --sysctl net.ipv6.conf.all.disable_ipv6=0 \
             --sysctl net.ipv4.conf.all.src_valid_mark=1 \
@@ -132,631 +116,353 @@ jobs:
             if echo "$RESULT" | grep -qE "warp=(on|plus)"; then echo "✅ WARP active!"; break; else sleep 5; fi
           done
 
-      # ── Step 4: Dependencies ───────────────────────────
       - name: "📦 Install Dependencies"
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-pip ffmpeg zip curl jq bc unzip
+          sudo apt-get install -y -qq python3-pip ffmpeg curl jq bc rar
           pip3 install --upgrade yt-dlp --quiet
 
-      # ── Step 5: Setup Parameters ──────────────────────
-      - name: "🔧 Setup Download Parameters"
+      - name: "🔧 Setup Parameters"
         id: setup
         env:
           SC_URLS: ${{ github.event.inputs.soundcloud_urls }}
           SC_QUALITY: ${{ github.event.inputs.quality }}
-          SC_FORMAT: ${{ github.event.inputs.format_choice }}
           SC_TYPE: ${{ github.event.inputs.download_type }}
           SC_MAX: ${{ github.event.inputs.max_tracks }}
-          SC_LYRICS: ${{ github.event.inputs.extract_lyrics }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-          BRANCH: ${{ github.ref_name }}
+          SC_PREMIUM: ${{ github.event.inputs.is_premium }}
         run: |
           SC_URLS="${SC_URLS}"
           QUALITY="${SC_QUALITY}"
-          FORMAT_CHOICE="${SC_FORMAT}"
           DOWNLOAD_TYPE="${SC_TYPE}"
           MAX_TRACKS="${SC_MAX}"
-          EXTRACT_LYRICS="${SC_LYRICS}"
-          
+          IS_PREMIUM="${SC_PREMIUM}"
+
           echo "════════════════════════════════════════"
           echo "  $PROJECT_NAME | $PROJECT_URL"
           echo "════════════════════════════════════════"
-          echo "🎵 URLs: ${SC_URLS}"
-          echo "🎧 Quality: ${QUALITY} | Format: ${FORMAT_CHOICE}"
-          echo "📋 Type: ${DOWNLOAD_TYPE} | Max: ${MAX_TRACKS}"
-          echo "📝 Lyrics: ${EXTRACT_LYRICS}"
-          
+          echo "🎧 URLs: ${SC_URLS}"
+          echo "🎵 Quality: ${QUALITY} | Type: ${DOWNLOAD_TYPE} | Max: ${MAX_TRACKS}"
+          echo "⭐ Premium: ${IS_PREMIUM}"
+
           echo "SC_URLS=${SC_URLS}" >> $GITHUB_ENV
           echo "QUALITY=${QUALITY}" >> $GITHUB_ENV
-          echo "FORMAT_CHOICE=${FORMAT_CHOICE}" >> $GITHUB_ENV
           echo "DOWNLOAD_TYPE=${DOWNLOAD_TYPE}" >> $GITHUB_ENV
           echo "MAX_TRACKS=${MAX_TRACKS}" >> $GITHUB_ENV
-          echo "EXTRACT_LYRICS=${EXTRACT_LYRICS}" >> $GITHUB_ENV
-          echo "REPO_OWNER=${REPO_OWNER}" >> $GITHUB_ENV
-          echo "REPO_NAME=${REPO_NAME}" >> $GITHUB_ENV
-          echo "BRANCH=${BRANCH}" >> $GITHUB_ENV
-          echo "BACKUP_DIR=/tmp/sc_downloads_$$" >> $GITHUB_ENV
-          echo "REPO_DIR=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
-          echo "CACHE_INDEX=${GITHUB_WORKSPACE}/soundcloud/cache_index.json" >> $GITHUB_ENV
-          
+          echo "IS_PREMIUM=${IS_PREMIUM}" >> $GITHUB_ENV
+          echo "TMP_DIR=/tmp/sc_downloads_$$" >> $GITHUB_ENV
           mkdir -p /tmp/sc_downloads_$$
-          mkdir -p "${GITHUB_WORKSPACE}/soundcloud"
-          
-          # Initialize cache index if not exists
-          if [ ! -f "${GITHUB_WORKSPACE}/soundcloud/cache_index.json" ]; then
-            echo '{}' > "${GITHUB_WORKSPACE}/soundcloud/cache_index.json"
-          fi
-          
-          # Quality mapping
+
+          # Quality mapping: high→320kbps MP3, medium→128kbps MP3
           case "${QUALITY}" in
-            best)   FORMAT="bestaudio/best" ;;
-            high)   FORMAT="bestaudio[abr>=256]/bestaudio" ;;
-            medium) FORMAT="bestaudio[abr>=160]/bestaudio" ;;
-            low)    FORMAT="bestaudio[abr>=96]/bestaudio" ;;
+            high)   FORMAT="bestaudio[abr>=256]/bestaudio/best" ;;
+            medium) FORMAT="bestaudio[abr>=128]/bestaudio/best" ;;
             *)      FORMAT="bestaudio/best" ;;
           esac
-          
-          echo "FORMAT=$FORMAT" >> $GITHUB_ENV
-          
-          # Playlist flag
+          echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
+
           if [ "$DOWNLOAD_TYPE" = "playlist" ] || [ "$DOWNLOAD_TYPE" = "all_artist" ]; then
             PLAYLIST_FLAG="--yes-playlist --playlist-end ${MAX_TRACKS}"
           else
             PLAYLIST_FLAG="--no-playlist"
           fi
-          echo "PLAYLIST_FLAG=$PLAYLIST_FLAG" >> $GITHUB_ENV
-          
-          # Format flag
-          case "$FORMAT_CHOICE" in
-            mp3)  EXTRACT_FLAG="--extract-audio --audio-format mp3 --audio-quality 0 --embed-metadata --embed-thumbnail" ;;
-            m4a)  EXTRACT_FLAG="--extract-audio --audio-format m4a --audio-quality 0 --embed-metadata --embed-thumbnail" ;;
-            opus) EXTRACT_FLAG="--extract-audio --audio-format opus --audio-quality 0 --embed-metadata --embed-thumbnail" ;;
-            flac) EXTRACT_FLAG="--extract-audio --audio-format flac --audio-quality 0 --embed-metadata --embed-thumbnail" ;;
-            *)    EXTRACT_FLAG="--extract-audio --audio-format mp3 --audio-quality 0 --embed-metadata --embed-thumbnail" ;;
-          esac
-          echo "EXTRACT_FLAG=$EXTRACT_FLAG" >> $GITHUB_ENV
+          echo "PLAYLIST_FLAG=${PLAYLIST_FLAG}" >> $GITHUB_ENV
           echo "✅ Setup complete"
 
-      # ═══════════════════════════════════════════════════
-      # 🆕 Step 5.5: CACHE CHECK — skip if already downloaded
-      # ═══════════════════════════════════════════════════
-      - name: "🔍 Cache Check — Skip Existing"
-        id: cache_check
-        run: |
-          #!/bin/bash
-          set -e
-          
-          SC_URLS="${{ env.SC_URLS }}"
-          CACHE_INDEX="${{ env.CACHE_INDEX }}"
-          REPO_DIR="${{ env.REPO_DIR }}"
-          
-          # Extract track ID from URL
-          TRACK_ID=$(echo "$SC_URLS" | grep -oE '[0-9]{6,12}' | head -1 || echo "")
-          
-          if [ -n "$TRACK_ID" ]; then
-            # Check cache index
-            CACHED_PATH=$(jq -r ".\"${TRACK_ID}\".path // empty" "$CACHE_INDEX" 2>/dev/null || echo "")
-            
-            if [ -n "$CACHED_PATH" ] && [ -f "${REPO_DIR}/${CACHED_PATH}" ]; then
-              echo "✅ ALREADY CACHED: ${CACHED_PATH}"
-              echo "CACHE_HIT=true" >> $GITHUB_ENV
-              echo "CACHED_FILE=${CACHED_PATH}" >> $GITHUB_ENV
-              echo "CACHED_ARTIST=$(jq -r ".\"${TRACK_ID}\".artist // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
-              echo "CACHED_TITLE=$(jq -r ".\"${TRACK_ID}\".title // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
-              echo "CACHED_GENRE=$(jq -r ".\"${TRACK_ID}\".genre // \"Unknown\"" "$CACHE_INDEX")" >> $GITHUB_ENV
-              echo "CACHED_THUMB=$(jq -r ".\"${TRACK_ID}\".thumbnail // \"\"" "$CACHE_INDEX")" >> $GITHUB_ENV
-            else
-              echo "🆕 Not in cache — will download"
-              echo "CACHE_HIT=false" >> $GITHUB_ENV
-            fi
-          else
-            echo "⚠️ Could not extract track ID"
-            echo "CACHE_HIT=false" >> $GITHUB_ENV
-          fi
-
-      # ═══════════════════════════════════════════════════
-      # Step 6: Download & Process Tracks (SKIP if cache hit)
-      # ═══════════════════════════════════════════════════
-      - name: "🎵 Download & Process Tracks"
+      - name: "🎧 Download & Process"
         id: download
-        if: env.CACHE_HIT != 'true'
         env:
-          BACKUP_DIR: ${{ env.BACKUP_DIR }}
           FORMAT: ${{ env.FORMAT }}
           QUALITY: ${{ env.QUALITY }}
-          FORMAT_CHOICE: ${{ env.FORMAT_CHOICE }}
-          EXTRACT_FLAG: ${{ env.EXTRACT_FLAG }}
           PLAYLIST_FLAG: ${{ env.PLAYLIST_FLAG }}
           SC_URLS: ${{ env.SC_URLS }}
-          EXTRACT_LYRICS: ${{ env.EXTRACT_LYRICS }}
-          REPO_OWNER: ${{ env.REPO_OWNER }}
-          REPO_NAME: ${{ env.REPO_NAME }}
-          BRANCH: ${{ env.BRANCH }}
-          REPO_DIR: ${{ env.REPO_DIR }}
-          CACHE_INDEX: ${{ env.CACHE_INDEX }}
-          GITHUB_WORKSPACE: ${{ env.REPO_DIR }}
+          IS_PREMIUM: ${{ env.IS_PREMIUM }}
+          TMP_DIR: ${{ env.TMP_DIR }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
         run: |
           #!/bin/bash
           shopt -s nullglob
           set -e
-          
-          # ═══════════════════════════════════════════
-          # Helper functions
-          # ═══════════════════════════════════════════
+
+          TARGET_SIZE_BYTES=$(( 45 * 1024 * 1024 ))
+          BALE_API="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          ADMIN_ID="${ADMIN_CHAT_ID}"
+          MAX_PARTS="${MAX_PARTS}"
+
           sanitize_name() {
             local name="$1"
-            name=$(echo "$name" | sed 's/[()（）]/_/g' | sed 's/[][{}\/\\<>|:;'"'"'"]/_/g')
+            name=$(echo "$name" | sed 's/[()（）]/_/g' | sed 's/[][{}\\/\\<>|:;'"'"'"]/_/g')
             name=$(echo "$name" | tr '[:space:]｜　' '-' | tr -c 'a-zA-Z0-9_-' '-' | tr -s '-' | sed 's/^-//;s/-$//')
             [ -z "$name" ] && name="unknown"
             echo "$name"
           }
-          
+
           format_number() {
             local num=$1
-            if [ -z "$num" ] || [ "$num" = "null" ]; then echo "0"; return; fi
-            if [ "$num" -gt 1000000 ] 2>/dev/null; then
-              echo "$(echo "scale=1; $num / 1000000" | bc)M"
-            elif [ "$num" -gt 1000 ] 2>/dev/null; then
-              echo "$(echo "scale=1; $num / 1000" | bc)K"
-            else
-              echo "$num"
-            fi
+            [ -z "$num" ] || [ "$num" = "null" ] && echo "0" && return
+            [ "$num" -gt 1000000 ] 2>/dev/null && echo "$(echo "scale=1; $num/1000000" | bc)M" && return
+            [ "$num" -gt 1000 ] 2>/dev/null && echo "$(echo "scale=1; $num/1000" | bc)K" && return
+            echo "$num"
           }
-          
-          # ═══════════════════════════════════════════
-          # Fetch full metadata
-          # ═══════════════════════════════════════════
-          # Convert space-separated URLs to array
+
+          notify_oversized() {
+            local fname="$1" fsize="$2" url="$3"
+            local fsize_mb=$(( fsize / 1024 / 1024 ))
+            local caption="⚠️ *فایل بیشتر از ۴۵ مگابایت است!*\n\n📁 *نام:* ${fname}\n📦 *حجم:* ${fsize_mb}MB\n🔗 *لینک:* ${url}\n\n❌ امکان دانلود در نسخه رایگان وجود ندارد.\n⭐ با خرید اشتراک پریمیوم محدودیت حجم برداشته میشود."
+            local kb='{"inline_keyboard":[[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$caption" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${kb}}" > /dev/null 2>&1
+          }
+
+          notify_multipart_info() {
+            local fname="$1" total_parts="$2" url="$3"
+            local caption="📦 *فایل به ${total_parts} پارت ۴۵MB تقسیم شد.*\n\n📁 *نام:* ${fname}\n📥 همه پارت‌ها را دانلود کنید، سپس *پارت ۱* را Extract کنید.\n\n🔗 *لینک:* ${url}"
+            local kb='{"inline_keyboard":[[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":$(echo "$caption" | jq -Rsc '.'),\"parse_mode\":\"Markdown\",\"reply_markup\":${kb}}" > /dev/null 2>&1
+          }
+
+          notify_cache() {
+            local platform="$1" url="$2" quality="$3" file_id="$4" channel_id="$5" message_id="$6" file_size="$7" file_name="$8" is_multipart="$9" total_parts="${10}"
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${ADMIN_ID}\",\"text\":\"/cache ${platform} ${url} ${quality} ${file_id} ${channel_id} ${message_id} ${file_size} ${file_name} ${is_multipart} ${total_parts}\"}" > /dev/null 2>&1
+            echo "  📤 Cache notification sent"
+          }
+
           read -ra URL_ARRAY <<< "$SC_URLS"
           TOTAL_URLS=${#URL_ARRAY[@]}
-          
+
           for SC_URL in "${URL_ARRAY[@]}"; do
-          
-          echo "🔍 Fetching metadata for: $SC_URL"
-          
-          INFO_JSON=$(yt-dlp \
-            --proxy "socks5://127.0.0.1:1080" \
-            --dump-json \
-            --skip-download \
-            "$SC_URL" 2>/dev/null || echo "{}")
-          
+
+          echo "🔍 Fetching metadata: $SC_URL"
+          INFO_JSON=$(yt-dlp --proxy "socks5://127.0.0.1:1080" --dump-json --skip-download "$SC_URL" 2>/dev/null || echo "{}")
+
           ARTIST=$(echo "$INFO_JSON" | jq -r '.uploader // .artist // "Unknown Artist"')
           TITLE=$(echo "$INFO_JSON" | jq -r '.title // "Unknown Track"')
-          GENRE=$(echo "$INFO_JSON" | jq -r '.genre // "Unknown Genre"')
-          TRACK_ID=$(echo "$INFO_JSON" | jq -r '.id // ""')
           DURATION=$(echo "$INFO_JSON" | jq -r '.duration // 0')
-          PLAY_COUNT=$(echo "$INFO_JSON" | jq -r '.play_count // .like_count // 0')
-          LIKE_COUNT=$(echo "$INFO_JSON" | jq -r '.like_count // 0')
-          REPOST_COUNT=$(echo "$INFO_JSON" | jq -r '.repost_count // 0')
-          DESCRIPTION=$(echo "$INFO_JSON" | jq -r '.description // ""')
+          PLAY_COUNT=$(echo "$INFO_JSON" | jq -r '.play_count // .view_count // 0')
           THUMBNAIL_URL=$(echo "$INFO_JSON" | jq -r '.thumbnail // ""')
-          
-          echo "  🎤 Artist: $ARTIST"
-          echo "  🎵 Track: $TITLE"
-          echo "  🎸 Genre: $GENRE"
-          echo "  ⏱ Duration: ${DURATION}s"
-          
-          ARTIST_SLUG=$(sanitize_name "$ARTIST")
-          GENRE_SLUG=$(sanitize_name "$GENRE")
-          TRACK_SLUG=$(sanitize_name "$TITLE")
-          
-          # ═══════════════════════════════════════════
-          # Create folder structure
-          # ═══════════════════════════════════════════
-          ARTIST_DIR="${REPO_DIR}/soundcloud/${ARTIST_SLUG}"
-          GENRE_DIR="${REPO_DIR}/soundcloud/_genres/${GENRE_SLUG}"
-          mkdir -p "$ARTIST_DIR" "$GENRE_DIR"
-          
-          if [ ! -L "${GENRE_DIR}/${ARTIST_SLUG}" ] && [ "$GENRE_SLUG" != "unknown-genre" ]; then
-            ln -sf "../../${ARTIST_SLUG}" "${GENRE_DIR}/${ARTIST_SLUG}" 2>/dev/null || true
-          fi
-          
-          # ═══════════════════════════════════════════
-          # Artist info
-          # ═══════════════════════════════════════════
-          # Artist info — using printf to avoid YAML brace issues
-          printf '{\n  "artist": "%s",\n  "artist_url": "%s",\n  "artist_id": "%s",\n  "genre": "%s",\n  "total_plays": %s,\n  "total_likes": %s,\n  "total_reposts": %s,\n  "last_updated": "%s"\n}\n' \
-            "$ARTIST" \
-            "$(echo "$INFO_JSON" | jq -r '.uploader_url // ""')" \
-            "$(echo "$INFO_JSON" | jq -r '.uploader_id // ""')" \
-            "$GENRE" \
-            "${PLAY_COUNT:-0}" \
-            "${LIKE_COUNT:-0}" \
-            "${REPOST_COUNT:-0}" \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            > "${ARTIST_DIR}/artist_info.json"
-          echo "  📝 Updated artist_info.json"
-          
-          # ═══════════════════════════════════════════
-          # Download
-          # ═══════════════════════════════════════════
+
+          echo "  🎤 $ARTIST | 🎵 $TITLE | 👁 $(format_number $PLAY_COUNT)"
+
           TMP_DIR="tmp_sc_$$"
           mkdir -p "$TMP_DIR"
-          
-          echo "⬇️ Downloading: $TITLE"
-          
-          yt-dlp \
-            --proxy "socks5://127.0.0.1:1080" \
+
+          # Download as MP3
+          yt-dlp --proxy "socks5://127.0.0.1:1080" \
             --format "$FORMAT" \
-            $EXTRACT_FLAG \
-            --write-thumbnail \
+            --extract-audio --audio-format mp3 --audio-quality 0 \
+            --embed-metadata --embed-thumbnail \
+            --write-thumbnail --convert-thumbnails jpg \
             --no-cache-dir \
             --output "${TMP_DIR}/%(title)s.%(ext)s" \
-            --no-part \
-            $PLAYLIST_FLAG \
-            --retries 5 \
-            --fragment-retries 5 \
-            --no-check-certificates \
-            --concurrent-fragments 8 \
-            --buffer-size 16K \
-            --http-chunk-size 10M \
-            --progress \
-            --newline \
-            "$SC_URL" 2>&1 || {
-              echo "  🔄 Retry without proxy..."
-              yt-dlp \
-                --format "$FORMAT" \
-                $EXTRACT_FLAG \
-                --write-thumbnail \
-                --no-cache-dir \
-                --output "${TMP_DIR}/%(title)s.%(ext)s" \
-                --no-part \
-                $PLAYLIST_FLAG \
-                --retries 5 \
-                --fragment-retries 5 \
-                --no-check-certificates \
-                --concurrent-fragments 8 \
-                --progress \
-                --newline \
-                "$SC_URL" 2>&1
-            }
-          
-          # ═══════════════════════════════════════════
-          # Quality Gate
-          # ═══════════════════════════════════════════
-          for AUDIO_FILE in "$TMP_DIR"/*.$FORMAT_CHOICE; do
+            --no-part $PLAYLIST_FLAG \
+            --retries 5 --fragment-retries 5 --no-check-certificates \
+            --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M \
+            --progress --newline "$SC_URL" 2>&1 || {
+            echo "  🔄 Retry without proxy..."
+            yt-dlp --format "$FORMAT" \
+              --extract-audio --audio-format mp3 --audio-quality 0 \
+              --embed-metadata --embed-thumbnail \
+              --write-thumbnail --convert-thumbnails jpg \
+              --no-cache-dir \
+              --output "${TMP_DIR}/%(title)s.%(ext)s" \
+              --no-part $PLAYLIST_FLAG \
+              --retries 5 --fragment-retries 5 --no-check-certificates \
+              --concurrent-fragments 8 --progress --newline "$SC_URL" 2>&1
+          }
+
+          for AUDIO_FILE in "$TMP_DIR"/*.mp3; do
             [ -f "$AUDIO_FILE" ] || continue
-            BITRATE=$(ffprobe -v error -show_entries format=bit_rate -of csv=p=0 "$AUDIO_FILE" 2>/dev/null || echo "0")
-            BITRATE_KBPS=$(( BITRATE / 1000 ))
-            echo "  🎧 Bitrate: ${BITRATE_KBPS}kbps"
-            if [ "$BITRATE" -gt 0 ] 2>/dev/null && [ "$BITRATE" -lt 96000 ] 2>/dev/null; then
-              echo "  ⚠️ Low bitrate — rejecting"
-              rm -f "$AUDIO_FILE"
-            fi
-          done
-          
-          # ═══════════════════════════════════════════
-          # Lyrics
-          # ═══════════════════════════════════════════
-          if [ "$EXTRACT_LYRICS" = "true" ]; then
-            echo "📝 Extracting lyrics..."
-            LYRICS=$(echo "$INFO_JSON" | jq -r '.description // ""' | grep -iE 'lyrics|verse|chorus' -A 50 | head -60 || echo "")
-            if [ -n "$LYRICS" ]; then
-              echo "$LYRICS" > "${ARTIST_DIR}/${TRACK_SLUG}.lrc"
-              echo "  ✅ Lyrics saved: ${TRACK_SLUG}.lrc"
-            fi
-          fi
-          
-          # ═══════════════════════════════════════════
-          # Move files to repo
-          # ═══════════════════════════════════════════
-          TRACK_COUNT=0
-          
-          for AUDIO_FILE in "$TMP_DIR"/*.$FORMAT_CHOICE; do
-            [ -f "$AUDIO_FILE" ] || continue
+
             BASENAME=$(basename "$AUDIO_FILE")
-            FILENAME_NO_EXT="${BASENAME%.*}"
-            SAFE_NAME=$(sanitize_name "$FILENAME_NO_EXT")
-            
-            cp "$AUDIO_FILE" "${ARTIST_DIR}/${SAFE_NAME}.${FORMAT_CHOICE}"
-            echo "  📦 Saved: soundcloud/${ARTIST_SLUG}/${SAFE_NAME}.${FORMAT_CHOICE}"
-            
-            mkdir -p "${BACKUP_DIR}/${ARTIST_SLUG}"
-            cp "$AUDIO_FILE" "${BACKUP_DIR}/${ARTIST_SLUG}/${SAFE_NAME}.${FORMAT_CHOICE}"
-            
-            TRACK_COUNT=$((TRACK_COUNT + 1))
-            
-            THUMB_FILE=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
-            if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
-              cp "$THUMB_FILE" "${ARTIST_DIR}/${SAFE_NAME}.jpg" 2>/dev/null
-              cp "$THUMB_FILE" "${BACKUP_DIR}/${ARTIST_SLUG}/${SAFE_NAME}.jpg" 2>/dev/null
+            SAFE_NAME=$(sanitize_name "${BASENAME%.*}")
+            FILE_SIZE=$(stat -c%s "$AUDIO_FILE" 2>/dev/null || echo 0)
+
+            echo "  📦 ${SAFE_NAME}.mp3 — $(( FILE_SIZE / 1024 / 1024 ))MB"
+
+            # ═══ SIZE CHECK ═══
+            if [ "$FILE_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
+              if [ "$IS_PREMIUM" = "true" ]; then
+                echo "  ⭐ Premium user — splitting with RAR..."
+                SPLIT_DIR="/tmp/rar_split_$$"
+                mkdir -p "$SPLIT_DIR"
+                cp "$AUDIO_FILE" "${SPLIT_DIR}/${SAFE_NAME}.mp3"
+                cd "$SPLIT_DIR"
+                rar a -v${TARGET_SIZE_MB}m -ep1 -m0 -idq "${SAFE_NAME}.part.rar" "${SAFE_NAME}.mp3"
+                rm -f "${SAFE_NAME}.mp3"
+                cd - > /dev/null
+
+                TOTAL_PARTS=$(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar 2>/dev/null | wc -l)
+                if [ "$TOTAL_PARTS" -gt "$MAX_PARTS" ]; then
+                  echo "  ⚠️ Too many parts — rejecting"
+                  if [ -n "$CHAT_ID" ]; then
+                    notify_oversized "${SAFE_NAME}.mp3" "$FILE_SIZE" "$SC_URL"
+                  fi
+                  rm -rf "$SPLIT_DIR"
+                  continue
+                fi
+
+                echo "  📦 Split into ${TOTAL_PARTS} RAR parts"
+                PART_NUM=0
+                FIRST_MESSAGE_ID=0
+                FIRST_FILE_ID=""
+
+                for PART_FILE in $(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar | sort); do
+                  [ -f "$PART_FILE" ] || continue
+                  PART_NUM=$((PART_NUM + 1))
+                  PART_NAME=$(basename "$PART_FILE")
+                  echo "  📤 Uploading part ${PART_NUM}/${TOTAL_PARTS}: ${PART_NAME}"
+
+                  UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendDocument" \
+                    -F "chat_id=${CHANNEL_ID}" \
+                    -F "document=@${PART_FILE}" \
+                    -F "caption=")
+
+                  MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
+                  FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.document.file_id // ""')
+
+                  if [ "$PART_NUM" -eq 1 ]; then
+                    FIRST_MESSAGE_ID=$MESSAGE_ID
+                    FIRST_FILE_ID=$FILE_ID
+                  fi
+
+                  [ "$MESSAGE_ID" != "0" ] && echo "    ✅ Part ${PART_NUM} uploaded" || echo "    ❌ Part ${PART_NUM} failed"
+                  sleep 2
+                done
+
+                if [ -n "$CHAT_ID" ] && [ -n "$FIRST_FILE_ID" ] && [ "$FIRST_MESSAGE_ID" != "0" ]; then
+                  notify_cache "soundcloud" "$SC_URL" "$QUALITY" "$FIRST_FILE_ID" "${CHANNEL_ID}" "$FIRST_MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.mp3" "1" "$TOTAL_PARTS"
+                fi
+
+                if [ -n "$CHAT_ID" ]; then
+                  notify_multipart_info "${SAFE_NAME}.mp3" "$TOTAL_PARTS" "$SC_URL"
+                fi
+
+                rm -rf "$SPLIT_DIR"
+              else
+                echo "  ⚠️ Free user — >45MB rejected"
+                if [ -n "$CHAT_ID" ]; then
+                  notify_oversized "${SAFE_NAME}.mp3" "$FILE_SIZE" "$SC_URL"
+                fi
+              fi
+            else
+              # ═══ ≤45MB: Direct upload ═══
+              if [ -n "$CHANNEL_ID" ]; then
+                UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendAudio" \
+                  -F "chat_id=${CHANNEL_ID}" -F "audio=@${AUDIO_FILE}" -F "caption=")
+
+                FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.audio.file_id // ""')
+                MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
+
+                if [ -n "$FILE_ID" ] && [ "$MESSAGE_ID" != "0" ]; then
+                  echo "  ✅ Uploaded (msg_id: $MESSAGE_ID)"
+                  if [ -n "$CHAT_ID" ]; then
+                    notify_cache "soundcloud" "$SC_URL" "$QUALITY" "$FILE_ID" "${CHANNEL_ID}" "$MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.mp3" "0" "1"
+                  fi
+                else
+                  echo "  ❌ Upload failed: $UPLOAD_RESPONSE"
+                fi
+                sleep 2
+              fi
             fi
-            
-            CACHE_ENTRY=$(jq -n \
-              --arg path "soundcloud/${ARTIST_SLUG}/${SAFE_NAME}.${FORMAT_CHOICE}" \
-              --arg artist "$ARTIST" \
-              --arg title "$TITLE" \
-              --arg genre "$GENRE" \
-              --arg thumbnail "$THUMBNAIL_URL" \
-              '{path: $path, artist: $artist, title: $title, genre: $genre, thumbnail: $thumbnail, cached_at: "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}')
-            
-            jq --arg id "$TRACK_ID" --argjson entry "$CACHE_ENTRY" \
-              '. + {($id): $entry}' "$CACHE_INDEX" > /tmp/cache_tmp.json
-            mv /tmp/cache_tmp.json "$CACHE_INDEX"
-            echo "  💾 Cached: $TRACK_ID"
           done
 
-            # Save detailed track info
-            printf '{\n  "title": "%s",\n  "artist": "%s",\n  "genre": "%s",\n  "duration": %s,\n  "bpm": %s,\n  "tags": %s,\n  "waveform_url": "%s",\n  "artwork_url": "%s",\n  "permalink_url": "%s",\n  "created_at": "%s"\n}\n' \
-              "$TITLE" \
-              "$ARTIST" \
-              "$GENRE" \
-              "${DURATION:-0}" \
-              "$(echo "$INFO_JSON" | jq -r '.bpm // 0')" \
-              "$(echo "$INFO_JSON" | jq -r '.tags // []' | jq -c '.')" \
-              "$(echo "$INFO_JSON" | jq -r '.waveform_url // ""')" \
-              "$(echo "$INFO_JSON" | jq -r '.thumbnail // ""')" \
-              "$(echo "$INFO_JSON" | jq -r '.permalink_url // ""')" \
-              "$(echo "$INFO_JSON" | jq -r '.created_at // ""')" \
-              > "${ARTIST_DIR}/${TRACK_SLUG}_info.json"
-            echo "  📋 Saved track info: ${TRACK_SLUG}_info.json"
-            
-          # ═══════════════════════════════════════════
-          # README
-          # ═══════════════════════════════════════════
-          TRACK_LIST=$(ls "${ARTIST_DIR}"/*.${FORMAT_CHOICE} 2>/dev/null | while read f; do
-            bn=$(basename "$f" .${FORMAT_CHOICE})
-            echo "  🎵 ${bn}"
-          done)
-          
-          printf '# %s\n\n**Genre:** %s  \n**SoundCloud:** [%s](%s)\n\n---\n\n## Stats\n\n| Plays | Likes | Reposts |\n|-------|-------|---------|\n| %s | %s | %s |\n\n---\n\n## Tracks\n\n%s\n\n---\n\n*Downloaded via [khashayar.one](https://khashayar.one)*\n' \
-            "$ARTIST" \
-            "$GENRE" \
-            "$ARTIST" \
-            "$(echo "$INFO_JSON" | jq -r '.uploader_url // ""')" \
-            "$(format_number $PLAY_COUNT)" \
-            "$(format_number $LIKE_COUNT)" \
-            "$(format_number $REPOST_COUNT)" \
-            "$(echo "$TRACK_LIST" | sed 's/^/  🎵 /')" \
-            > "${ARTIST_DIR}/README.md"
-          echo "  📝 Updated README.md"
-          
           rm -rf "$TMP_DIR"
-          
-          echo "ARTIST_SLUG=${ARTIST_SLUG}" >> $GITHUB_ENV
+
           echo "ARTIST=${ARTIST}" >> $GITHUB_ENV
-          echo "GENRE=${GENRE}" >> $GITHUB_ENV
           echo "TRACK_TITLE=${TITLE}" >> $GITHUB_ENV
-          echo "TRACK_COUNT=${TRACK_COUNT}" >> $GITHUB_ENV
-          echo "TRACK_ID=${TRACK_ID}" >> $GITHUB_ENV
           echo "DURATION=${DURATION}" >> $GITHUB_ENV
           echo "THUMBNAIL_URL=${THUMBNAIL_URL}" >> $GITHUB_ENV
           echo "PLAY_COUNT=${PLAY_COUNT}" >> $GITHUB_ENV
-          echo "✅ Done: ${TRACK_COUNT} track(s) from this URL"
-          
-          done  # end of URL loop
-          
-          echo "✅ All URLs processed: ${TOTAL_URLS} total"
 
-      # ── Step 7: Commit & Push ─────────────────────────
-      - name: "📤 Commit to Repository"
-        if: env.CACHE_HIT != 'true'
-        env:
-          ARTIST: ${{ env.ARTIST }}
-          TRACK_TITLE: ${{ env.TRACK_TITLE }}
-          FORMAT_CHOICE: ${{ env.FORMAT_CHOICE }}
-          REPO_DIR: ${{ env.REPO_DIR }}
-          BRANCH: ${{ env.BRANCH }}
+          done
+
+          echo "✅ All URLs processed: ${TOTAL_URLS}"
+
+      - name: "🛑 Stop WARP"
+        if: always()
         run: |
-          cd "$REPO_DIR"
-          git add soundcloud/
-          if git diff --staged --quiet; then
-            echo "✅ No changes"
-          else
-            ARTIST_NAME="${ARTIST:-Unknown Artist}"
-            TRACK_NAME="${TRACK_TITLE:-Unknown Track}"
-            FORMAT="${FORMAT_CHOICE:-mp3}"
-            git commit -m "feat(soundcloud): add ${ARTIST_NAME} — ${TRACK_NAME} [${FORMAT}]"
-            git pull --rebase origin ${BRANCH} || true
-            git push origin ${BRANCH}
-            echo "✅ Pushed"
-          fi
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
 
-      # ═══════════════════════════════════════════════════
-      # 🆕 Step 9: Send Thumbnail Photo + Caption to Bale
-      # ═══════════════════════════════════════════════════
-      - name: "🖼️ Send Track Info to User"
+      - name: "📬 Send Complete Result"
         if: github.event.inputs.chat_id != ''
         env:
           BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
-          CACHE_HIT: ${{ env.CACHE_HIT }}
-          CACHED_ARTIST: ${{ env.CACHED_ARTIST }}
-          CACHED_TITLE: ${{ env.CACHED_TITLE }}
-          CACHED_GENRE: ${{ env.CACHED_GENRE }}
-          CACHED_THUMB: ${{ env.CACHED_THUMB }}
+          SC_URLS: ${{ env.SC_URLS }}
           ARTIST: ${{ env.ARTIST }}
           TRACK_TITLE: ${{ env.TRACK_TITLE }}
-          GENRE: ${{ env.GENRE }}
-          THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
           DURATION: ${{ env.DURATION }}
           PLAY_COUNT: ${{ env.PLAY_COUNT }}
-          SC_URLS: ${{ env.SC_URLS }}
-        run: |
-          #!/bin/bash
-          
-          if [ "$CACHE_HIT" = "true" ]; then
-            ARTIST_NAME="$CACHED_ARTIST"
-            TRACK_NAME="$CACHED_TITLE"
-            GENRE_NAME="$CACHED_GENRE"
-            THUMB_URL="$CACHED_THUMB"
-            DURATION_VAL="0"
-            PLAY_COUNT_VAL="0"
-          else
-            ARTIST_NAME="$ARTIST"
-            TRACK_NAME="$TRACK_TITLE"
-            GENRE_NAME="$GENRE"
-            THUMB_URL="$THUMBNAIL_URL"
-            DURATION_VAL="$DURATION"
-            PLAY_COUNT_VAL="$PLAY_COUNT"
-          fi
-          
-          if [ "$DURATION_VAL" -gt 0 ] 2>/dev/null; then
-            DUR_MIN=$(( DURATION_VAL / 60 ))
-            DUR_REM=$(( DURATION_VAL % 60 ))
-            DUR_FMT="${DUR_MIN}:$(printf '%02d' $DUR_REM)"
-          else
-            DUR_FMT="—"
-          fi
-          
-          if [ "$PLAY_COUNT_VAL" != "0" ] && [ "$PLAY_COUNT_VAL" -gt 0 ] 2>/dev/null; then
-            if [ "$PLAY_COUNT_VAL" -gt 1000000 ]; then
-              PLAYS_FMT="$(echo "scale=1; $PLAY_COUNT_VAL / 1000000" | bc)M"
-            elif [ "$PLAY_COUNT_VAL" -gt 1000 ]; then
-              PLAYS_FMT="$(echo "scale=1; $PLAY_COUNT_VAL / 1000" | bc)K"
-            else
-              PLAYS_FMT="$PLAY_COUNT_VAL"
-            fi
-          else
-            PLAYS_FMT="—"
-          fi
-          
-          CAPTION="🎵 *${TRACK_NAME}*
-
-          🎤 *هنرمند:* ${ARTIST_NAME}
-          🎸 *ژانر:* ${GENRE_NAME}
-          ⏱ *مدت:* ${DUR_FMT}
-          👁 *پخش:* ${PLAYS_FMT}
-
-          🔗 [مشاهده در SoundCloud](${SC_URLS})"
-          
-          PHOTO_SENT=false
-          if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
-            jq -n \
-              --arg chat_id "$CHAT_ID" \
-              --arg photo "$THUMB_URL" \
-              --arg caption "$CAPTION" \
-              '{chat_id: $chat_id, photo: $photo, caption: $caption, parse_mode: "Markdown"}' \
-              > /tmp/photo_payload.json
-            
-            PHOTO_RESPONSE=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendPhoto" \
-              -H "Content-Type: application/json" \
-              -d @/tmp/photo_payload.json)
-            
-            if echo "$PHOTO_RESPONSE" | jq -e '.ok == true' > /dev/null 2>&1; then
-              PHOTO_SENT=true
-            fi
-          fi
-          
-          if [ "$PHOTO_SENT" = false ]; then
-            jq -n \
-              --arg chat_id "$CHAT_ID" \
-              --arg text "$CAPTION" \
-              '{chat_id: $chat_id, text: $text, parse_mode: "Markdown"}' \
-              > /tmp/text_payload.json
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" \
-              -d @/tmp/text_payload.json > /dev/null 2>&1
-          fi
-          
-          echo "✅ Track info sent"
-
-      # ═══════════════════════════════════════════════════
-      # Step 10: Upload Audio to User's Channel
-      # ═══════════════════════════════════════════════════
-      - name: "📤 Upload to User's Channel"
-        if: github.event.inputs.channel_id != ''
-        env:
-          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
-          BACKUP_DIR: ${{ env.BACKUP_DIR }}
-          FORMAT_CHOICE: ${{ env.FORMAT_CHOICE }}
-          CACHE_HIT: ${{ env.CACHE_HIT }}
-          CACHED_FILE: ${{ env.CACHED_FILE }}
-          REPO_DIR: ${{ env.REPO_DIR }}
-        run: |
-          #!/bin/bash
-          BALE_API_URL="https://tapi.bale.ai/bot${BALE_TOKEN}"
-          echo "📤 Uploading audio to Bale channel..."
-          
-          if [ "$CACHE_HIT" = "true" ]; then
-            # Upload from repo cache
-            FILE_PATH="${REPO_DIR}/${CACHED_FILE}"
-            FILENAME=$(basename "$FILE_PATH")
-            echo "  📄 Uploading from cache: $FILENAME"
-            
-            curl -s -X POST "${BALE_API_URL}/sendAudio" \
-              -F "chat_id=${CHANNEL_ID}" \
-              -F "audio=@${FILE_PATH}" \
-              -F "caption=🎵 ${FILENAME%.*} | SoundCloud" > /dev/null 2>&1
-            echo "    ✅ Uploaded"
-          else
-            # Upload ALL files from ALL artist folders in backup
-            for ARTIST_FOLDER in "$BACKUP_DIR"/*/ ; do
-              [ -d "$ARTIST_FOLDER" ] || continue
-              ARTIST_NAME=$(basename "$ARTIST_FOLDER")
-              
-              for FILE in "$ARTIST_FOLDER"/*.$FORMAT_CHOICE; do
-                [ -f "$FILE" ] || continue
-                FILENAME=$(basename "$FILE")
-                TRACK_NAME="${FILENAME%.*}"
-                
-                echo "  📄 Uploading: $FILENAME"
-                
-                curl -s -X POST "${BALE_API_URL}/sendAudio" \
-                  -F "chat_id=${CHANNEL_ID}" \
-                  -F "audio=@${FILE}" \
-                  -F "caption=🎵 ${ARTIST_NAME} — ${TRACK_NAME} | SoundCloud" > /dev/null 2>&1
-                echo "    ✅ Uploaded"
-                sleep 3
-              done
-            done
-          fi
-          
-          echo "✅ All audio files uploaded"
-
-      # ═══════════════════════════════════════════════════
-      # Step 11: Notify User with Channel Link
-      # ═══════════════════════════════════════════════════
-      - name: "📬 Notify User"
-        if: github.event.inputs.chat_id != ''
-        env:
-          BALE_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          THUMBNAIL_URL: ${{ env.THUMBNAIL_URL }}
           CHANNEL_ID: ${{ github.event.inputs.channel_id }}
           CHANNEL_USERNAME: ${{ github.event.inputs.channel_username }}
         run: |
           #!/bin/bash
-          
-          ARTIST_NAME="${{ env.ARTIST }}"
-          CACHE_HIT="${{ env.CACHE_HIT }}"
-          CACHED_ARTIST="${{ env.CACHED_ARTIST }}"
-          TRACK_COUNT="${{ env.TRACK_COUNT }}"
-          
-          if [ "$CACHE_HIT" = "true" ]; then
-            DISPLAY_ARTIST="$CACHED_ARTIST"
-            SPEED_TEXT="⚡ *از حافظه کش ارسال شد!*"
-            TRACK_COUNT="1"
+          BALE_API="https://tapi.bale.ai/bot${BALE_TOKEN}"
+          CHAT_ID="${CHAT_ID}"
+          ARTIST_NAME="${ARTIST:-Unknown Artist}"
+          TITLE_NAME="${TRACK_TITLE:-Unknown Track}"
+          THUMB_URL="${THUMBNAIL_URL:-}"
+          DURATION_VAL="${DURATION:-0}"
+          PLAY_VAL="${PLAY_COUNT:-0}"
+
+          if [ "$DURATION_VAL" -gt 0 ] 2>/dev/null; then
+            DUR_FMT="$(( DURATION_VAL / 60 )):$(printf '%02d' $(( DURATION_VAL % 60 )))"
           else
-            DISPLAY_ARTIST="$ARTIST_NAME"
-            SPEED_TEXT=""
+            DUR_FMT="—"
           fi
-          
+
+          if [ "$PLAY_VAL" != "0" ] && [ "$PLAY_VAL" != "null" ] && [ "$PLAY_VAL" -gt 0 ] 2>/dev/null; then
+            if [ "$PLAY_VAL" -gt 1000000 ]; then PLAYS_FMT="$(echo "scale=1; $PLAY_VAL/1000000" | bc)M"
+            elif [ "$PLAY_VAL" -gt 1000 ]; then PLAYS_FMT="$(echo "scale=1; $PLAY_VAL/1000" | bc)K"
+            else PLAYS_FMT="$PLAY_VAL"; fi
+          else
+            PLAYS_FMT="—"
+          fi
+
           if [ -n "$CHANNEL_USERNAME" ]; then
-            CHANNEL_LINK="https://ble.ir/$CHANNEL_USERNAME"
-            KEYBOARD=$(jq -n --arg url "$CHANNEL_LINK" \
-              '{inline_keyboard: [[{text: "📂 مشاهده و دریافت فایل", url: $url}]]}')
+            CHANNEL_LINK="https://ble.ir/${CHANNEL_USERNAME}"
           elif [ -n "$CHANNEL_ID" ]; then
-            CHANNEL_LINK="https://ble.ir/im/p/$CHANNEL_ID"
-            KEYBOARD=$(jq -n --arg url "$CHANNEL_LINK" \
-              '{inline_keyboard: [[{text: "📂 مشاهده و دریافت فایل", url: $url}]]}')
+            CHANNEL_LINK="https://ble.ir/im/p/${CHANNEL_ID}"
           else
-            KEYBOARD='{"inline_keyboard": []}'
+            CHANNEL_LINK="https://ble.ir"
           fi
-          
-          TEXT=$'✅ *دانلود از SoundCloud کامل شد!*\n\n🎤 *هنرمند:* '"${DISPLAY_ARTIST}"$'\n🎵 *تعداد آهنگ:* '"${TRACK_COUNT:-1}"$'\n'"${SPEED_TEXT}"$'\n\n📁 فایل در کانال آرشیو شما ذخیره شد.\n\n👇 برای دریافت روی دکمه زیر کلیک کنید:'
-          
-          jq -n \
-            --arg chat_id "$CHAT_ID" \
-            --arg text "$TEXT" \
-            --argjson reply_markup "$KEYBOARD" \
-            '{chat_id: $chat_id, text: $text, parse_mode: "Markdown", reply_markup: $reply_markup}' \
-            > /tmp/notify.json
-          
-          curl -s -X POST "https://tapi.bale.ai/bot${BALE_TOKEN}/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d @/tmp/notify.json > /dev/null 2>&1
-          
-          echo "✅ Notification sent"
+
+          CAPTION="🎵 *${TITLE_NAME}*
+
+          🎤 *هنرمند:* ${ARTIST_NAME}
+          ⏱ *مدت:* ${DUR_FMT}  |  👁 *پخش:* ${PLAYS_FMT}
+
+          ✅ *دانلود کامل شد!*
+          📁 فایل در کانال آرشیو شما ذخیره شد.
+
+          🔗 [مشاهده در SoundCloud](${SC_URLS})"
+
+          KEYBOARD='{"inline_keyboard":[[{"text":"📂 دریافت فایل از کانال آرشیو","url":"'"${CHANNEL_LINK}"'"}],[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
+
+          ESCAPED_CAPTION=$(echo "$CAPTION" | jq -Rsc '.')
+
+          if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
+            PHOTO_RESULT=$(curl -s -X POST "${BALE_API}/sendPhoto" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"photo\":\"${THUMB_URL}\",\"caption\":${ESCAPED_CAPTION},\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}")
+
+            if ! echo "$PHOTO_RESULT" | jq -e '.ok == true' > /dev/null 2>&1; then
+              curl -s -X POST "${BALE_API}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":${ESCAPED_CAPTION},\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}" > /dev/null 2>&1
+            fi
+          else
+            curl -s -X POST "${BALE_API}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${CHAT_ID}\",\"text\":${ESCAPED_CAPTION},\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}" > /dev/null 2>&1
+          fi
+
+          echo "✅ Result sent to user"
