@@ -1,12 +1,12 @@
 # ============================================================
-# instagram-dl.yml — Bale Instagram Downloader V3
-# Repository: github.com/khashayardev/DownloadHub
+# instagram-dl.yml — Bale Instagram Downloader V4
+# Repository: github.com/khashayarone/DownloadHub
 # ============================================================
-# Features V3:
+# Features V4:
 #   ۱. Download posts (single/multi-slide), reels, stories, IGTV
 #   ۲. Handles mixed media: video + photo posts together
-#   ۳. Photo posts sent via sendPhoto (not skipped)
-#   ۴. Post caption extracted and set as file caption
+#   ۳. Thumbnail skipped — only actual media downloaded
+#   ۴. Clean caption: 👤 username | 📸 Instagram | 🔗 link
 #   ۵. Quality mapping: 720→best, 480→medium
 #   ۶. Two-Layer Cache compatible (notifies bot via /cache)
 #   ۷. Premium-aware: >45MB split into .partX.rar
@@ -18,7 +18,7 @@
 #   ۱۳. Compatible with Bale DownloadHub Bot v7
 # ============================================================
 
-name: "📸 Instagram Downloader V3"
+name: "📸 Instagram Downloader V4"
 
 on:
   workflow_dispatch:
@@ -153,11 +153,10 @@ jobs:
           echo "TMP_DIR=/tmp/ig_downloads_$$" >> $GITHUB_ENV
           mkdir -p /tmp/ig_downloads_$$
 
-          # Quality mapping: 720 → best, 480 → medium
           case "${QUALITY}" in
-            720)   FORMAT="best/bestvideo+bestaudio/best" ;;
-            480)   FORMAT="best[height<=720]/bestvideo[height<=720]+bestaudio/best" ;;
-            *)     FORMAT="best/bestvideo+bestaudio/best" ;;
+            720)   FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
+            480)   FORMAT="bestvideo[height<=720]+bestaudio/bestvideo[height<=720]*+bestaudio*/best" ;;
+            *)     FORMAT="bestvideo+bestaudio/bestvideo*+bestaudio*/best" ;;
           esac
           echo "FORMAT=${FORMAT}" >> $GITHUB_ENV
 
@@ -173,7 +172,6 @@ jobs:
         id: download
         env:
           FORMAT: ${{ env.FORMAT }}
-          QUALITY: ${{ env.QUALITY }}
           PLAYLIST_FLAG: ${{ env.PLAYLIST_FLAG }}
           IG_URLS: ${{ env.IG_URLS }}
           IS_PREMIUM: ${{ env.IS_PREMIUM }}
@@ -205,15 +203,6 @@ jobs:
             [ "$num" -gt 1000000 ] 2>/dev/null && echo "$(echo "scale=1; $num/1000000" | bc)M" && return
             [ "$num" -gt 1000 ] 2>/dev/null && echo "$(echo "scale=1; $num/1000" | bc)K" && return
             echo "$num"
-          }
-
-          truncate_text() {
-            local text="$1" max_len="${2:-900}"
-            if [ ${#text} -gt $max_len ]; then
-              echo "${text:0:$max_len}..."
-            else
-              echo "$text"
-            fi
           }
 
           notify_oversized() {
@@ -250,33 +239,25 @@ jobs:
             case "$ext" in
               mp4|webm|mkv|mov)
                 response=$(curl -s -X POST "${BALE_API}/sendVideo" \
-                  -F "chat_id=${CHANNEL_ID}" \
-                  -F "video=@${file}" \
-                  -F "caption=${caption}")
+                  -F "chat_id=${CHANNEL_ID}" -F "video=@${file}" -F "caption=${caption}")
                 file_id=$(echo "$response" | jq -r '.result.video.file_id // ""')
                 ;;
               jpg|jpeg|png|webp)
                 response=$(curl -s -X POST "${BALE_API}/sendPhoto" \
-                  -F "chat_id=${CHANNEL_ID}" \
-                  -F "photo=@${file}" \
-                  -F "caption=${caption}")
+                  -F "chat_id=${CHANNEL_ID}" -F "photo=@${file}" -F "caption=${caption}")
                 file_id=$(echo "$response" | jq -r '.result.photo[-1].file_id // ""')
                 ;;
               *)
                 response=$(curl -s -X POST "${BALE_API}/sendDocument" \
-                  -F "chat_id=${CHANNEL_ID}" \
-                  -F "document=@${file}" \
-                  -F "caption=${caption}")
+                  -F "chat_id=${CHANNEL_ID}" -F "document=@${file}" -F "caption=${caption}")
                 file_id=$(echo "$response" | jq -r '.result.document.file_id // ""')
                 ;;
             esac
-
             message_id=$(echo "$response" | jq -r '.result.message_id // 0')
             echo "${file_id}|${message_id}"
           }
 
           read -ra URL_ARRAY <<< "$IG_URLS"
-          TOTAL_URLS=${#URL_ARRAY[@]}
 
           for IG_URL in "${URL_ARRAY[@]}"; do
 
@@ -285,7 +266,6 @@ jobs:
 
           USERNAME=$(echo "$INFO_JSON" | jq -r '.uploader // .channel // "Unknown User"')
           TITLE=$(echo "$INFO_JSON" | jq -r '.title // .description // "Untitled"')
-          POST_CAPTION=$(echo "$INFO_JSON" | jq -r '.description // ""')
           LIKE_COUNT=$(echo "$INFO_JSON" | jq -r '.like_count // 0')
           THUMBNAIL_URL=$(echo "$INFO_JSON" | jq -r '.thumbnail // ""')
 
@@ -294,64 +274,61 @@ jobs:
           TMP_DIR="tmp_ig_$$"
           mkdir -p "$TMP_DIR"
 
-          # Download all media (video + photos together)
+          # Download media — skip thumbnail, get actual content
           yt-dlp --proxy "socks5://127.0.0.1:1080" \
             --format "$FORMAT" \
             --merge-output-format mp4 \
-            --write-thumbnail --convert-thumbnails jpg \
             --no-cache-dir \
             --output "${TMP_DIR}/%(title)s_%(id)s.%(ext)s" \
             --no-part $PLAYLIST_FLAG \
             --retries 5 --fragment-retries 5 --no-check-certificates \
             --concurrent-fragments 8 --buffer-size 16K --http-chunk-size 10M \
-            --progress --newline "$IG_URL" 2>&1 || {
+            --progress --newline \
+            --extractor-args "instagram:include_thumbnail=false" \
+            "$IG_URL" 2>&1 || {
             echo "  🔄 Retry without proxy..."
             yt-dlp --format "$FORMAT" \
               --merge-output-format mp4 \
-              --write-thumbnail --convert-thumbnails jpg \
               --no-cache-dir \
               --output "${TMP_DIR}/%(title)s_%(id)s.%(ext)s" \
               --no-part $PLAYLIST_FLAG \
               --retries 5 --fragment-retries 5 --no-check-certificates \
-              --concurrent-fragments 8 --progress --newline "$IG_URL" 2>&1
+              --concurrent-fragments 8 --progress --newline \
+              --extractor-args "instagram:include_thumbnail=false" \
+              "$IG_URL" 2>&1
           }
 
-          # Prepare caption (truncated to Bale's 1024 char limit)
-          CLEAN_CAPTION=""
-          if [ -n "$POST_CAPTION" ] && [ "$POST_CAPTION" != "null" ]; then
-            CLEAN_CAPTION=$(echo "$POST_CAPTION" | sed 's/#\S*//g' | sed 's/\s\+/ /g' | xargs)
-            CLEAN_CAPTION=$(truncate_text "$CLEAN_CAPTION" 900)
-            CLEAN_CAPTION="📸 ${USERNAME}\n${CLEAN_CAPTION}"
-          else
-            CLEAN_CAPTION="📸 ${USERNAME}"
-          fi
+          # Build clean caption for each file
+          BUILD_CAPTION="👤 ${USERNAME} | 📸 Instagram | 🔗 ${IG_URL}"
 
           ITEM_COUNT=0
           FIRST_FILE_ID=""
           FIRST_MESSAGE_ID=0
-          LAST_CAPTION_FILE=""
 
-          # Separate video and photo files
-          VIDEO_FILES=()
-          PHOTO_FILES=()
-
-          for MEDIA_FILE in "$TMP_DIR"/*; do
-            [ -f "$MEDIA_FILE" ] || continue
-            BASENAME=$(basename "$MEDIA_FILE")
-            EXT="${BASENAME##*.}"
-
-            case "$EXT" in
-              jpg|jpeg|png|webp)
-                PHOTO_FILES+=("$MEDIA_FILE")
-                ;;
-              *)
-                VIDEO_FILES+=("$MEDIA_FILE")
-                ;;
-            esac
+          # Collect all non-thumbnail files
+          ALL_FILES=()
+          for f in "$TMP_DIR"/*; do
+            [ -f "$f" ] || continue
+            ALL_FILES+=("$f")
           done
 
-          # Upload videos first, then photos
-          ALL_FILES=("${VIDEO_FILES[@]}" "${PHOTO_FILES[@]}")
+          # If no files downloaded at all, try fallback without extractor-args
+          if [ ${#ALL_FILES[@]} -eq 0 ]; then
+            echo "  🔄 Fallback: retry without extractor-args..."
+            yt-dlp --proxy "socks5://127.0.0.1:1080" \
+              --format "$FORMAT" \
+              --merge-output-format mp4 \
+              --no-cache-dir \
+              --output "${TMP_DIR}/%(title)s_%(id)s.%(ext)s" \
+              --no-part $PLAYLIST_FLAG \
+              --retries 5 --no-check-certificates \
+              --progress --newline \
+              "$IG_URL" 2>&1 || true
+            for f in "$TMP_DIR"/*; do
+              [ -f "$f" ] || continue
+              ALL_FILES+=("$f")
+            done
+          fi
 
           for MEDIA_FILE in "${ALL_FILES[@]}"; do
             [ -f "$MEDIA_FILE" ] || continue
@@ -361,20 +338,14 @@ jobs:
             EXT="${BASENAME##*.}"
             FILE_SIZE=$(stat -c%s "$MEDIA_FILE" 2>/dev/null || echo 0)
 
+            # Skip small files (< 5KB = thumbnails/icons)
+            if [ "$FILE_SIZE" -lt 5120 ]; then
+              echo "  ⏭️ Skipping tiny file: ${BASENAME} ($FILE_SIZE bytes)"
+              continue
+            fi
+
             echo "  📦 ${BASENAME} — $(( FILE_SIZE / 1024 / 1024 ))MB"
 
-            # Determine if this is the last file (gets the full caption)
-            LAST_FILE=""
-            if [ ${#ALL_FILES[@]} -gt 1 ]; then
-              LAST_FILE="${ALL_FILES[${#ALL_FILES[@]}-1]}"
-            fi
-
-            FILE_CAPTION=""
-            if [ "$MEDIA_FILE" = "$LAST_FILE" ] || [ ${#ALL_FILES[@]} -eq 1 ]; then
-              FILE_CAPTION="$CLEAN_CAPTION"
-            fi
-
-            # ═══ SIZE CHECK ═══
             if [ "$FILE_SIZE" -gt "$TARGET_SIZE_BYTES" ]; then
               if [ "$IS_PREMIUM" = "true" ]; then
                 echo "  ⭐ Premium user — splitting with RAR..."
@@ -398,25 +369,18 @@ jobs:
 
                 echo "  📦 Split into ${TOTAL_PARTS} RAR parts"
                 PART_NUM=0
-
                 for PART_FILE in $(ls "${SPLIT_DIR}/${SAFE_NAME}.part"*.rar | sort); do
                   [ -f "$PART_FILE" ] || continue
                   PART_NUM=$((PART_NUM + 1))
                   echo "  📤 Uploading part ${PART_NUM}/${TOTAL_PARTS}"
-
                   UPLOAD_RESPONSE=$(curl -s -X POST "${BALE_API}/sendDocument" \
-                    -F "chat_id=${CHANNEL_ID}" \
-                    -F "document=@${PART_FILE}" \
-                    -F "caption=")
-
+                    -F "chat_id=${CHANNEL_ID}" -F "document=@${PART_FILE}" -F "caption=")
                   MESSAGE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.message_id // 0')
                   FILE_ID=$(echo "$UPLOAD_RESPONSE" | jq -r '.result.document.file_id // ""')
-
                   if [ "$PART_NUM" -eq 1 ] && [ -z "$FIRST_FILE_ID" ]; then
                     FIRST_MESSAGE_ID=$MESSAGE_ID
                     FIRST_FILE_ID=$FILE_ID
                   fi
-
                   [ "$MESSAGE_ID" != "0" ] && echo "    ✅ Part ${PART_NUM} uploaded" || echo "    ❌ Part ${PART_NUM} failed"
                   sleep 2
                 done
@@ -424,11 +388,9 @@ jobs:
                 if [ -n "$CHAT_ID" ] && [ -n "$FIRST_FILE_ID" ] && [ "$FIRST_MESSAGE_ID" != "0" ]; then
                   notify_cache "instagram" "$IG_URL" "$QUALITY" "$FIRST_FILE_ID" "${CHANNEL_ID}" "$FIRST_MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "1" "$TOTAL_PARTS"
                 fi
-
                 if [ -n "$CHAT_ID" ]; then
                   notify_multipart_info "${BASENAME}" "$TOTAL_PARTS" "$IG_URL"
                 fi
-
                 rm -rf "$SPLIT_DIR"
                 ITEM_COUNT=$((ITEM_COUNT + TOTAL_PARTS))
               else
@@ -438,9 +400,8 @@ jobs:
                 fi
               fi
             else
-              # ═══ ≤45MB: Direct upload ═══
               if [ -n "$CHANNEL_ID" ]; then
-                RESULT=$(upload_file "$MEDIA_FILE" "$FILE_CAPTION" "$EXT")
+                RESULT=$(upload_file "$MEDIA_FILE" "$BUILD_CAPTION" "$EXT")
                 FILE_ID=$(echo "$RESULT" | cut -d'|' -f1)
                 MESSAGE_ID=$(echo "$RESULT" | cut -d'|' -f2)
 
@@ -459,7 +420,6 @@ jobs:
             fi
           done
 
-          # Send cache notification for first file
           if [ -n "$CHAT_ID" ] && [ -n "$FIRST_FILE_ID" ] && [ "$FIRST_MESSAGE_ID" != "0" ]; then
             notify_cache "instagram" "$IG_URL" "$QUALITY" "$FIRST_FILE_ID" "${CHANNEL_ID}" "$FIRST_MESSAGE_ID" "$FILE_SIZE" "${SAFE_NAME}.${EXT}" "0" "1"
           fi
@@ -474,7 +434,7 @@ jobs:
 
           done
 
-          echo "✅ All URLs processed: ${TOTAL_URLS}"
+          echo "✅ All URLs processed"
 
       - name: "🛑 Stop WARP"
         if: always()
@@ -532,14 +492,12 @@ jobs:
           🔗 [مشاهده در Instagram](${IG_URLS})"
 
           KEYBOARD='{"inline_keyboard":[[{"text":"📂 دریافت فایل از کانال آرشیو","url":"'"${CHANNEL_LINK}"'"}],[{"text":"🔙 بازگشت به منوی اصلی","callback_data":"back_to_main"}]]}'
-
           ESCAPED_CAPTION=$(echo "$CAPTION" | jq -Rsc '.')
 
           if [ -n "$THUMB_URL" ] && [ "$THUMB_URL" != "null" ]; then
             PHOTO_RESULT=$(curl -s -X POST "${BALE_API}/sendPhoto" \
               -H "Content-Type: application/json" \
               -d "{\"chat_id\":\"${CHAT_ID}\",\"photo\":\"${THUMB_URL}\",\"caption\":${ESCAPED_CAPTION},\"parse_mode\":\"Markdown\",\"reply_markup\":${KEYBOARD}}")
-
             if ! echo "$PHOTO_RESULT" | jq -e '.ok == true' > /dev/null 2>&1; then
               curl -s -X POST "${BALE_API}/sendMessage" \
                 -H "Content-Type: application/json" \
