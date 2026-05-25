@@ -15,7 +15,7 @@
  *  - پنل مدیریت کامل با آمار و لاگ
  *  - سیستم پشتیبانی مستقیم
  * 
- * Repository: github.com/khashayardev/DownloadHub
+ * Repository: github.com/khashayarone/DownloadHub
  * ═══════════════════════════════════════════════════
  */
 
